@@ -1,9 +1,9 @@
 #!/bin/bash
 # lock.sh — system-wide named resource locks for agents (scope, rig, dmm, ...).
-# Lock = directory /tmp/claude-locks/<name>.lock (mkdir is atomic).
+# Lock = directory $DIR/<name>.lock (mkdir is the atomic primitive).
 # Exit codes: 0 = ok/free, 1 = busy/held, 2 = error/unknown (treat as BUSY).
 set -u
-DIR=/tmp/claude-locks
+DIR=${AGENT_LOCK_DIR:-/tmp/claude-locks}
 mkdir -p "$DIR" || exit 2
 cmd=${1:-}; name=${2:-}
 
@@ -30,22 +30,41 @@ holder_dead() { # true only if holder pid PROVABLY dead (unparseable => alive)
   ! ps -p "$pid" > /dev/null 2>&1
 }
 
+steal_gate() { # serialize stealers: only the gate holder may rm a stale lock
+  local g="$1.steal" m now
+  mkdir "$g" 2>/dev/null && return 0
+  # break a gate leaked by a crashed stealer (held normally for milliseconds)
+  m=$(stat -f %m "$g" 2>/dev/null || stat -c %Y "$g" 2>/dev/null) || return 1
+  now=$(date +%s)
+  [ $((now - m)) -gt 60 ] && rmdir "$g" 2>/dev/null && mkdir "$g" 2>/dev/null
+}
+
 show() { cat "$1/info" 2>/dev/null || echo "(info unreadable)"; }
 
 case "$cmd" in
   acquire)
     sanitize "$name"; lp=$(lockpath "$name"); me=$(owner_pid)
+    note=$(printf '%s' "${3:-}" | tr -d '\000-\037\177')  # keep info file one-line-per-key
     for i in 1 2; do
       if mkdir "$lp" 2>/dev/null; then
         printf 'resource=%s\npid=%s\nuser=%s\nsince=%s\nnote=%s\n' \
-          "$name" "$me" "$USER" "$(date '+%Y-%m-%d %H:%M:%S')" "${3:-}" > "$lp/info"
+          "$name" "$me" "$USER" "$(date '+%Y-%m-%d %H:%M:%S')" "$note" > "$lp/info"
         echo "ACQUIRED $name"; exit 0
       fi
+      # mkdir can also fail for disk-full/perms/RO-fs: that's an error, not "held"
+      [ -d "$lp" ] || { echo "cannot create lock under $DIR" >&2; exit 2; }
       if [ "$(holder_pid "$lp")" = "$me" ] && [ "$me" != unknown ]; then
         echo "ACQUIRED $name (already held by this session)"; exit 0
       fi
       if [ "$i" = 1 ] && holder_dead "$lp"; then
-        echo "stale lock (holder pid dead), stealing" >&2; rm -rf "$lp"; continue
+        if steal_gate "$lp"; then
+          # re-check under the gate: the lock may have been stolen and re-acquired
+          # by a live session since our first look (check->rm must not be blind)
+          holder_dead "$lp" && { echo "stale lock (holder pid dead), stealing" >&2; rm -rf "$lp"; }
+          rmdir "$lp.steal" 2>/dev/null
+          continue
+        fi
+        echo "BUSY $name (another session is reclaiming it)"; exit 1
       fi
       echo "BUSY $name — held by:"; show "$lp"; exit 1
     done
@@ -67,6 +86,7 @@ case "$cmd" in
     fi
     echo "FREE $name"; exit 0 ;;
   list)
+    [ -r "$DIR" ] && [ -x "$DIR" ] || { echo "cannot read $DIR" >&2; exit 2; }
     found=0
     for lp in "$DIR"/*.lock; do
       [ -d "$lp" ] || continue; found=1

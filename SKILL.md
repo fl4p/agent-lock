@@ -7,7 +7,8 @@ description: System-wide named locks for exclusive-access shared resources (a sc
 
 One lock per user-chosen resource name, visible to every agent session on this
 machine. Backed by `~/.claude/skills/lock/lock.sh` (atomic `mkdir` under
-`/tmp/claude-locks/`, no dependencies).
+`/tmp/claude-locks/`, no dependencies; override the store with `AGENT_LOCK_DIR`
+— all sessions must use the same one).
 
 ## Commands
 
@@ -35,5 +36,7 @@ Resource names: `[A-Za-z0-9._-]+`, chosen by the user (e.g. `scope`, `fugu-rig`,
 
 The lock records the pid of the owning agent process (found by walking up the
 process tree). If that session dies, the next `acquire` detects the dead pid and
-steals the lock automatically — no daemon, no TTL. If the owner cannot be
-identified (`pid=unknown`), the lock is never auto-stolen and needs `--force`.
+steals the lock automatically — no daemon, no TTL. Concurrent stealers are
+serialized through a `.steal` gate and re-verify before removing, so only one
+can win. If the owner cannot be identified (`pid=unknown`), the lock is never
+auto-stolen and needs `--force`.
