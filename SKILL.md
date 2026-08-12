@@ -15,6 +15,7 @@ machine. Backed by `~/.claude/skills/lock/lock.sh` (atomic `mkdir` under
 ```bash
 L=~/.claude/skills/lock/lock.sh
 "$L" acquire <name> ["note"]   # take the lock; note = what you're doing
+"$L" wait <name> ["note"] [timeout_s]  # blocking acquire, retries every 2s (default timeout 3600)
 "$L" release <name> [--force]  # give it back; --force breaks another session's lock
 "$L" status  <name>            # FREE or HELD (+ holder info)
 "$L" list                      # all locks, [held] or [stale]
@@ -28,8 +29,11 @@ Resource names: `[A-Za-z0-9._-]+`, chosen by the user (e.g. `scope`, `fugu-rig`,
 1. **Acquire before touching** a shared resource; pass a short note saying why.
 2. **Release when done** with the resource — not at some later cleanup point.
 3. **Exit code 2 (or any failure to evaluate) means BUSY**, never free.
-4. If BUSY: report the holder info to the user and stop; do not poll in a tight
-   loop, and **never `--force` without explicitly asking the user first**.
+4. If BUSY: report the holder info to the user. To queue for the resource
+   instead, launch `wait` as a background task (Bash `run_in_background: true`)
+   — you'll be woken when it acquires or times out. Never poll `status` in a
+   foreground loop, and **never `--force` without explicitly asking the user
+   first**.
 5. Re-acquiring a lock this session already holds succeeds (idempotent).
 
 ## Crash recovery

@@ -20,6 +20,7 @@ git clone https://github.com/fl4p/agent-lock ~/.claude/skills/lock
 ```bash
 L=~/.claude/skills/lock/lock.sh
 "$L" acquire scope "ringing sweep"   # take the lock, say why
+"$L" wait scope "queued" 600         # blocking acquire: retry every 2s, give up after 600s
 "$L" status scope                    # FREE or HELD (+ holder info)
 "$L" list                            # all locks, [held] or [stale]
 "$L" release scope                   # give it back
@@ -49,6 +50,9 @@ is. Exit codes: `0` free/ok, `1` busy/held, `2` error (**treat as busy**).
   holder.
 - **Idempotent per session**: re-acquiring a lock the same session already
   holds succeeds.
+- **Background waiting**: `wait` is a blocking acquire (atomic retry loop, no
+  check-then-take race). Agents launch it as a background task and get woken
+  by their harness when the lock lands — no foreground polling.
 
 ## Caveats
 

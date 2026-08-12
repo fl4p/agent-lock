@@ -69,6 +69,18 @@ case "$cmd" in
       echo "BUSY $name — held by:"; show "$lp"; exit 1
     done
     echo "BUSY $name (race)"; exit 1 ;;
+  wait)
+    # blocking acquire: retry until acquired or timeout. Run it in the background
+    # (run_in_background / dtach) so the agent is woken when the lock lands.
+    sanitize "$name"
+    timeout=${4:-3600}; deadline=$(( $(date +%s) + timeout ))
+    while :; do
+      out=$("$0" acquire "$name" "${3:-}" 2>/dev/null); rc=$?
+      [ "$rc" = 0 ] && { echo "$out"; exit 0; }
+      [ "$rc" = 2 ] && { echo "error while waiting for $name" >&2; exit 2; }
+      [ "$(date +%s)" -ge "$deadline" ] && { echo "TIMEOUT waiting for $name after ${timeout}s"; exit 1; }
+      sleep 2
+    done ;;
   release)
     sanitize "$name"; lp=$(lockpath "$name")
     [ -d "$lp" ] || { echo "not locked: $name"; exit 0; }
