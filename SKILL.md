@@ -44,3 +44,27 @@ steals the lock automatically — no daemon, no TTL. Concurrent stealers are
 serialized through a `.steal` gate and re-verify before removing, so only one
 can win. If the owner cannot be identified (`pid=unknown`), the lock is never
 auto-stolen and needs `--force`.
+
+### Trap: acquire from the session, release from a background job → `--force`
+
+The pid comes from walking up the process tree, and **a background Bash job walks
+up to a different pid than the interactive session does.** So a lock acquired in
+the session and released from inside a background task fails:
+
+```
+held by another session (pid=33176, we are 83362); use --force to break
+```
+
+Both pids belong to the *same* Claude session. Nothing is wrong, nothing is
+stale, and the holder is very much alive — so crash recovery will never clear it
+either. The only exit is `--force`, which by rule 4 needs the user asked first.
+
+**Release the lock from the same context you took it in.** If a session takes a
+lock and then does its work through background tasks — which is normal for long
+bench runs — it has silently converted a well-behaved hold into one only the user
+can authorise clearing. Measured 2026-08-16: `scope` and `fugu-rig` held three
+hours past the end of the work, with two peer sessions blocked on the same rig.
+
+Before assuming a held lock belongs to someone else, check:
+`ps -p <pid> -o command=` — if it is a `claude --resume <your-own-session-id>`,
+it is yours.
