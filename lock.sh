@@ -149,11 +149,30 @@ owner_pid() { # walk ancestry to the long-lived agent process; "unknown" if none
 
 holder_pid() { sed -n 's/^pid=//p' "$1/info" 2>/dev/null; }
 
-holder_dead() { # true only if holder pid PROVABLY dead (unparseable => alive)
-  local pid; pid=$(holder_pid "$1")
+holder_dead() { # true ONLY if the holder pid is provably dead (anything else => alive)
+  local pid out; pid=$(holder_pid "$1")
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  # ps, not kill -0: kill -0 fails with EPERM on other users' live processes (fail-open)
-  ! ps -p "$pid" > /dev/null 2>&1
+  # ps, not kill -0: kill -0 fails with EPERM on other users' live processes (fail-open).
+  #
+  # But `! ps -p "$pid"` alone read EVERY nonzero ps result as proof of death -- a broken
+  # PATH, a fork that could not be taken, ps missing, a sandbox refusing it. The verdict this
+  # returns DELETES A LOCK, so a ps that cannot answer used to hand two sessions the same
+  # instrument, which is the failure this whole script exists to prevent.
+  #
+  # So: prove ps works before believing it about someone else, using OUR OWN pid as the
+  # control. If ps cannot see a process we know is alive, its silence about the holder means
+  # nothing. A guard that cannot run must not return "fine".
+  # The control checks the OUTPUT, not the exit status. A ps that exits 0 and prints nothing
+  # passes a status-only check and then "proves" every pid dead -- caught by test 20, which
+  # is the same shape as the bug being fixed one level down.
+  local self; self=$(ps -p $$ -o pid= 2>/dev/null | tr -d '[:space:]')
+  [ "$self" = "$$" ] || {
+    echo "cannot verify holder liveness (ps did not name our own pid) -- assuming ALIVE" >&2
+    return 1
+  }
+  out=$(ps -p "$pid" -o pid= 2>/dev/null)
+  [ -n "$out" ] && return 1        # ps named it: alive
+  return 0                         # ps works, and does not know this pid: dead
 }
 
 steal_gate() { # serialize stealers: only the gate holder may rm a stale lock

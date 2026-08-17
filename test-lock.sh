@@ -236,6 +236,31 @@ out=$("$L" status scope 2>&1); rc=$?
 check "status of an occupied-but-not-a-lock path is an ERROR" 2 "$rc" "$out"
 hasnt "  ...and never says FREE" "FREE" "$out"
 
+echo "== 20. a ps that cannot answer must not condemn a live holder =="
+# `! ps -p $pid` read every nonzero ps result as proof of death. The verdict deletes a lock,
+# so a ps that cannot run handed two sessions the same instrument.
+fresh
+seed_held_by_other scope "a live peer session"
+mkdir -p "$TMP/badbin"
+printf '#!/bin/sh\nexit 3\n' > "$TMP/badbin/ps"        # ps exists but always fails
+chmod +x "$TMP/badbin/ps"
+out=$(PATH="$TMP/badbin:$PATH" "$L" acquire scope "steal it?" 2>&1); rc=$?
+check "a broken ps does NOT steal the lock" 1 "$rc" "$out"
+has   "  ...and says why it could not verify" "assuming ALIVE" "$out"
+[ -d "$AGENT_LOCK_DIR/scope.lock" ] || bad "the peer's lock still exists" "it was deleted"
+[ -d "$AGENT_LOCK_DIR/scope.lock" ] && ok "the peer's lock still exists"
+
+printf '#!/bin/sh\nexit 0\n' > "$TMP/badbin/ps"        # ps "succeeds" but names nothing
+out=$(PATH="$TMP/badbin:$PATH" "$L" acquire scope "steal it?" 2>&1); rc=$?
+check "a ps that succeeds but names nothing does NOT steal either" 1 "$rc" "$out"
+
+echo "== 21. the control must not block a GENUINE steal =="
+fresh
+lp="$AGENT_LOCK_DIR/scope.lock"; mkdir -p "$lp"
+printf 'resource=scope\npid=999999\nuser=ghost\nsince=x\nnote=dead\n' > "$lp/info"
+out=$("$L" acquire scope "stealing a real corpse" 2>&1); rc=$?
+check "a provably dead holder is still stolen with ps working" 0 "$rc" "$out"
+
 echo
 echo "passed $pass, failed $fail"
 [ "$fail" = 0 ] || exit 1
