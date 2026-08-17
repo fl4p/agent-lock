@@ -18,11 +18,47 @@ L=~/.claude/skills/lock/lock.sh
 "$L" wait <name> ["note"] [timeout_s]  # blocking acquire, retries every 2s (default timeout 3600)
 "$L" release <name> [--force]  # give it back; --force breaks another session's lock
 "$L" status  <name>            # FREE or HELD (+ holder info)
-"$L" list                      # all locks, [held] or [stale]
+"$L" list                      # all locks, [held] / [stale] / [FLAGGED]
+"$L" note   <name> "text"      # correct the note on a lock you hold
+"$L" flag   <name> "reason"    # raise a warning that OUTLIVES the lock
+"$L" unflag <name>             # clear it
+"$L" resolve <name>            # what canonical lock does this name mean?
 ```
 
-Resource names: `[A-Za-z0-9._-]+`, chosen by the user (e.g. `scope`, `fugu-rig`,
-`dmm`). Exit codes: `0` = ok/free, `1` = busy/held, `2` = error.
+Exit codes: `0` = ok/free, `1` = busy/held/flagged, `2` = error.
+
+## Resource names are a closed set
+
+Names resolve through `aliases.conf`, so **one instrument has one lock however you spell
+it** — `scope`, `mxo`, `mxo4`, `mxo44` are the same mutex. Two sessions once held `scope`
+and `mxo4` simultaneously and both believed they had the MXO44 to themselves.
+
+**An unregistered name is refused, not granted.** A typo used to hand you your own private
+mutex, which is exclusivity that protects nothing. If you meant a real new resource, register
+it once:
+
+```bash
+"$L" acquire <name> "note" --new     # appends it to aliases.conf
+```
+
+Some names are refused *on purpose* because they are ambiguous — `dmm` names two instruments
+on this bench, so it makes you say `dmm6500` or `hp3458a`. `lock.sh resolve <name>` tells you
+what a name means without taking anything.
+
+## Flags: the thing that outlives the lock
+
+A lock says *busy*; it cannot say *broken*. When the rig faulted on 2026-08-13 — over-draw,
+then a burning smell — releasing the locks erased the only cross-session record that it must
+not be energised.
+
+```bash
+"$L" flag fugu-rig "over-draw then burning smell 2026-08-13 — do not energise"
+```
+
+`acquire` then **refuses** that resource, prints the reason, and stays refusing after any
+release, until someone runs `unflag`. `--ack` overrides for a single acquire and says so
+loudly. Raise a flag whenever you leave hardware in a state the next session must know about;
+this is worth more than the lock itself.
 
 ## Rules for the agent
 
@@ -34,7 +70,11 @@ Resource names: `[A-Za-z0-9._-]+`, chosen by the user (e.g. `scope`, `fugu-rig`,
    — you'll be woken when it acquires or times out. Never poll `status` in a
    foreground loop, and **never `--force` without explicitly asking the user
    first**.
-5. Re-acquiring a lock this session already holds succeeds (idempotent).
+5. Re-acquiring a lock this session already holds succeeds (idempotent), and a **differing
+   note updates it**. Keep the note true: it is what a peer session reads to decide whether
+   to wait, and a stale one is worse than none. Use `note` when you are not re-acquiring.
+6. **Leave a `flag` behind** if you leave hardware faulted, mid-configuration, or otherwise
+   unsafe for the next session — before you release.
 
 ## Crash recovery
 
