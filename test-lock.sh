@@ -261,6 +261,52 @@ printf 'resource=scope\npid=999999\nuser=ghost\nsince=x\nnote=dead\n' > "$lp/inf
 out=$("$L" acquire scope "stealing a real corpse" 2>&1); rc=$?
 check "a provably dead holder is still stolen with ps working" 0 "$rc" "$out"
 
+echo "== 22. --brief shortens the flag WITHOUT weakening the refusal =="
+fresh
+# Must be comfortably longer than show_flag's 110-char cut, with a marker PAST it: the
+# first version was 109 chars, so nothing was truncated and the test passed vacuously.
+LONG="BURNT SMELL do not energise. $(printf 'padding %.0s' $(seq 1 40))TAILMARKER"
+"$L" flag scope "$LONG" >/dev/null 2>&1
+out=$("$L" status scope 2>&1); rc=$?
+case "$out" in *TAILMARKER*) ok "plain status prints the whole reason" ;;
+              *) bad "plain status prints the whole reason" ;; esac
+out=$("$L" status scope --brief 2>&1); rc=$?
+case "$out" in *TAILMARKER*) bad "--brief truncates the reason" ;;
+              *) ok "--brief truncates the reason" ;; esac
+case "$out" in *full\ text:*) ok "--brief still points at the full flag file" ;;
+              *) bad "--brief still points at the full flag file" ;; esac
+check "--brief does not change the status exit code" 1 "$rc" "$out"
+
+# The refusal is the whole point of a flag: it must never be summarised, by any argument.
+out=$("$L" acquire scope "note" --brief 2>&1); rc=$?
+check "acquiring a FLAGGED resource still FAILS with --brief" 1 "$rc" "$out"
+case "$out" in *TAILMARKER*) ok "the REFUSAL still prints the flag in full despite --brief" ;;
+              *) bad "the REFUSAL still prints the flag in full despite --brief" ;; esac
+# --brief must not smuggle in an --ack.
+case "$out" in *"acquire refused"*) ok "--brief does not imply --ack" ;;
+              *) bad "--brief does not imply --ack" ;; esac
+"$L" unflag scope >/dev/null 2>&1
+
+echo "== 23. idle is REPORTED and never acted on =="
+fresh
+lp="$AGENT_LOCK_DIR/scope.lock"; mkdir -p "$lp"
+printf 'resource=scope\npid=1\nuser=peer\nsince=x\nnote=peer holds this\n' > "$lp/info"
+out=$("$L" status scope 2>&1)
+case "$out" in *idle*) bad "a fresh lock is NOT labelled idle" ;;
+              *) ok "a fresh lock is NOT labelled idle" ;; esac
+touch -t "$(date -v-3H '+%Y%m%d%H%M')" "$lp/info"
+out=$("$L" status scope 2>&1)
+case "$out" in *"idle 3h"*) ok "a 3-hour-quiet lock reports idle" ;;
+              *) bad "a 3-hour-quiet lock reports idle (got: $out)" ;; esac
+out=$("$L" acquire scope "mine" 2>&1); rc=$?
+check "an IDLE lock held by a live pid is still NOT stealable" 1 "$rc" "$out"
+case "$out" in *idle*) ok "the BUSY path shows idle, where you need it" ;;
+              *) bad "the BUSY path shows idle, where you need it" ;; esac
+# A missing/unreadable info file must not abort the status under set -u.
+rm -f "$lp/info"
+out=$("$L" status scope 2>&1); rc=$?
+check "status survives a lock with no info file" 1 "$rc" "$out"
+
 echo
 echo "passed $pass, failed $fail"
 [ "$fail" = 0 ] || exit 1
