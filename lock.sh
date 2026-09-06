@@ -175,6 +175,46 @@ holder_dead() { # true ONLY if the holder pid is provably dead (anything else =>
   return 0                         # ps works, and does not know this pid: dead
 }
 
+# --- idleness: the OTHER kind of stale ------------------------------------------------
+# holder_dead() only catches a holder whose pid is GONE. On 2026-09-06 a peer session held
+# fugu-rig for three hours after stopping at bring-up: pid alive, so never "stale", yet the
+# lock was abandoned in every sense that mattered and cost a blocking question. The info
+# file's mtime is a free activity signal -- acquire writes it, `note` rewrites it -- so an
+# untouched lock reports how long it has been quiet. This is INFORMATION, not a licence:
+# nothing here auto-steals on idleness, because idle is not dead and a long settle is a
+# legitimate reason to hold a rig silently.
+info_mtime() { stat -f %m "$1/info" 2>/dev/null; }
+
+age_str() { # $1 = seconds -> compact human duration
+  local s=${1:-0}
+  if   [ "$s" -lt 90 ];   then echo "${s}s"
+  elif [ "$s" -lt 5400 ]; then echo "$((s/60))m"
+  else echo "$((s/3600))h$(((s%3600)/60))m"; fi
+}
+
+idle_note() { # $1 = lockdir; echoes " [idle X]" past IDLE_MIN_S, else nothing
+  local m d; m=$(info_mtime "$1"); [ -n "$m" ] || return 0
+  d=$(( $(date +%s) - m ))
+  [ "$d" -ge "${IDLE_MIN_S:-600}" ] && printf ' [idle %s]' "$(age_str "$d")"
+  return 0
+}
+
+# --- flag rendering ------------------------------------------------------------------
+# A flag reason is a paragraph, and it printed IN FULL on every acquire, release and
+# status -- eight times in one session on 2026-09-06, several hundred words each. --brief
+# renders the header plus a truncated reason and the path to the whole thing. The REFUSAL
+# path never uses it: a stop that summarises the reason it is stopping you is not a stop.
+show_flag() { # $1 = flag file
+  if [ "${BRIEF:-no}" = yes ] && [ -r "$1" ]; then
+    printf '  flagged=%s by=%s\n' \
+      "$(sed -n 's/^flagged=//p' "$1" | head -1)" "$(sed -n 's/^by=//p' "$1" | head -1)"
+    printf '  reason: %s...\n  (full text: %s)\n' \
+      "$(sed -n 's/^reason=//p' "$1" | head -1 | cut -c1-110)" "$1"
+  else
+    sed 's/^/  /' "$1"
+  fi
+}
+
 steal_gate() { # serialize stealers: only the gate holder may rm a stale lock
   local g="$1.steal" m now
   mkdir "$g" 2>/dev/null && return 0
@@ -222,7 +262,7 @@ check_flag() { # $1 = canonical; refuses unless the caller passed --ack
     exit 1
   fi
   echo "WARNING: acquiring $1 over an active flag (--ack):" >&2
-  sed 's/^/  /' "$fp" >&2
+  show_flag "$fp" >&2
 }
 
 case "$cmd" in
@@ -236,6 +276,7 @@ case "$cmd" in
       case "$a" in
         --new) want_new=yes ;;
         --ack) ack=yes ;;
+        --brief) BRIEF=yes ;;
         *)     echo "unknown option: $a (the note is the 3rd argument)" >&2; exit 2 ;;
       esac
     done
@@ -294,7 +335,7 @@ case "$cmd" in
         fi
         echo "BUSY $canon (another session is reclaiming it)"; exit 1
       fi
-      echo "BUSY $canon — held by:"; show "$lp"; exit 1
+      echo "BUSY $canon — held by:$(idle_note "$lp")"; show "$lp"; exit 1
     done
     echo "BUSY $canon (race)"; exit 1 ;;
   wait)
@@ -363,14 +404,16 @@ case "$cmd" in
     fi ;;
   status)
     sanitize "$name"; canon_or_literal "$name"; canon=$CANON; lp=$(lockpath "$canon")
+    [ "${3:-}" = --brief ] && BRIEF=yes
     fp=$(flagpath "$canon"); flagged=no
     if [ -e "$fp" ]; then
       flagged=yes; echo "FLAGGED $canon:"
-      [ -r "$fp" ] && sed 's/^/  /' "$fp" || {
+      [ -r "$fp" ] && show_flag "$fp" || {
         echo "  (flag exists but is UNREADABLE)"; echo "UNKNOWN $canon"; exit 2; }
     fi
     if [ -d "$lp" ]; then
-      holder_dead "$lp" && echo "HELD $canon [stale — holder pid dead]" || echo "HELD $canon"
+      holder_dead "$lp" && echo "HELD $canon [stale — holder pid dead]" \
+        || echo "HELD $canon$(idle_note "$lp")"
       show "$lp"; exit 1
     fi
     # A non-directory at the lock path is not "free": something occupies the name and we
@@ -404,7 +447,7 @@ case "$cmd" in
     [ "$rrc" = 0 ] && { echo "$CANON"; exit 0; }
     unknown_die "$name" "$rrc" ;;
   *)
-    echo "usage: lock.sh acquire <name> [note] [--new] [--ack] | release <name> [--force]" >&2
+    echo "usage: lock.sh acquire <name> [note] [--new] [--ack] [--brief] | release <name> [--force]" >&2
     echo "       lock.sh note <name> \"text\" [--force] | flag <name> \"reason\" | unflag <name>" >&2
     echo "       lock.sh status <name> | list | resolve <name> | wait <name> [note] [timeout]" >&2
     exit 2 ;;
