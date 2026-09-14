@@ -20,6 +20,9 @@ L=~/.claude/skills/lock/lock.sh
 "$L" status  <name>            # FREE or HELD (+ holder info)
 "$L" list                      # all locks, [held] / [stale] / [FLAGGED]
 "$L" note   <name> "text"      # correct the note on a lock you hold
+"$L" run    <name> "note" [--timeout S] -- <cmd...>   # acquire, run, ALWAYS release
+"$L" park   <name> "reason"    # done with it but can't release: others may take it
+"$L" unpark <name>             # cancel that; it is a normal held lock again
 "$L" flag   <name> "reason"    # raise a warning that OUTLIVES the lock
 "$L" unflag <name>             # clear it
 "$L" resolve <name>            # what canonical lock does this name mean?
@@ -84,6 +87,51 @@ steals the lock automatically — no daemon, no TTL. Concurrent stealers are
 serialized through a `.steal` gate and re-verify before removing, so only one
 can win. If the owner cannot be identified (`pid=unknown`), the lock is never
 auto-stolen and needs `--force`.
+
+### If you are done with the hardware but cannot release: PARK it
+
+`release` is the only correct end to a lock, but sometimes the work is over and the lock
+is not: you are waiting on the user to answer, or holding the board powered for a
+follow-up they have to decide on. A lock in that state blocks every peer for hours while
+its own note says the run finished. Measured 2026-09-14: `esp32s3-9a70` held by a live
+session whose note read "awaiting Fab" — it knew it was done and had no way to say so.
+
+```sh
+"$L" park esp32s3-9a70 "test DONE. Board parked in ROM DOWNLOAD MODE — press reset before
+                        expecting the app to boot. Held only for the antenna follow-up."
+```
+
+A parked lock is still yours — `release` and `unpark` both still work — but `acquire`
+will now hand it to a peer, printing your reason and your note so the next session knows
+what state the hardware is in. That is why the reason is mandatory and why it should
+describe the HARDWARE, not your intentions.
+
+Park is a declaration by the holder, never a timeout. Only the holder can park, and an
+unparked lock held by a live process is never taken no matter how long it has been idle —
+idle is not dead, and a long settle is a legitimate reason to hold a rig silently.
+
+### Prefer `run`: the only shape where forgetting to release is impossible
+
+```sh
+"$L" run xiao-s3-jd9853 "flash HEAD, read 30 s" -- out/flash_exp.sh 30
+```
+
+It blocks until the lock is free (`--timeout`, default 3600 s), runs the command, and
+releases on **every** path out — normal exit, a failing command, Ctrl-C, SIGTERM. If the
+lock never comes free it exits 2 and **does not run the command at all**; a wrapper that
+ran the work anyway would be worse than none, because it would look like serialisation.
+
+The exit status is the **command's**, never the wrapper's. That is the point. The older
+advice was to run `wait` in the background so the agent is woken when the lock lands — but
+a backgrounded launch returns 0 *immediately*, and an agent that reads that 0 as "I hold
+the lock" goes on to touch the hardware. Measured 2026-09-14: that is how a session
+convinced itself it held a board it did not. If you must background, background `run`, and
+read the status from its own output, never from the launcher.
+
+Retrying around a busy board needs care too. `if cmd; then ...; fi` yields **0** when the
+condition fails and there is no `else`, so `rc=$?` after it reads 0 rather than the
+command's status — a retry loop written that way treats "BUSY, try again" as a fatal error
+and gives up on the first attempt. Capture with `cmd; rc=$?` on its own line.
 
 ### Trap: acquire from the session, release from a background job → `--force`
 

@@ -199,6 +199,31 @@ idle_note() { # $1 = lockdir; echoes " [idle X]" past IDLE_MIN_S, else nothing
   return 0
 }
 
+# --- parked: the third kind of stale -------------------------------------------------
+# holder_dead() catches a holder whose pid is GONE. idle_note() reports one that has gone
+# quiet but may legitimately be mid-settle, and deliberately does not steal. Neither
+# catches the case that actually blocks people: a LIVE holder that has finished with the
+# resource and is waiting on a human. Measured 2026-09-14 -- esp32s3-9a70 held for hours
+# by a live session whose own note read "awaiting Fab": it knew it was done, and had no
+# way to say "you may take this".
+#
+# `park` is the holder saying exactly that. It is a declaration, not a timeout: only the
+# holder can park, so nothing is ever taken from a session that still believes it is
+# using the rig. A parked lock is stealable by acquire, which prints the park reason --
+# the physical state of the hardware (mid-experiment, parked in ROM download mode, half
+# flashed) lives in that reason and the next holder must read it.
+parkpath() { echo "$1/parked"; }
+is_parked() { [ -f "$(parkpath "$1")" ]; }
+park_reason() { sed -n '2,$p' "$(parkpath "$1")" 2>/dev/null; }
+park_since() { sed -n '1p' "$(parkpath "$1")" 2>/dev/null; }
+park_note() { # $1 = lockdir; echoes " [PARKED x, reason]" or nothing
+  local m d r; is_parked "$1" || return 0
+  m=$(park_since "$1"); r=$(park_reason "$1")
+  d=$(( $(date +%s) - ${m:-0} ))
+  printf ' [PARKED %s: %s]' "$(age_str "$d")" "${r:-no reason given}"
+  return 0
+}
+
 # --- flag rendering ------------------------------------------------------------------
 # A flag reason is a paragraph, and it printed IN FULL on every acquire, release and
 # status -- eight times in one session on 2026-09-06, several hundred words each. --brief
@@ -325,11 +350,20 @@ case "$cmd" in
         fi
         echo "ACQUIRED $canon (already held by this session)"; exit 0
       fi
-      if [ "$i" = 1 ] && holder_dead "$lp"; then
+      if [ "$i" = 1 ] && { holder_dead "$lp" || is_parked "$lp"; }; then
         if steal_gate "$lp"; then
           # re-check under the gate: the lock may have been stolen and re-acquired
           # by a live session since our first look (check->rm must not be blind)
-          holder_dead "$lp" && { echo "stale lock (holder pid dead), stealing" >&2; rm -rf "$lp"; }
+          if holder_dead "$lp"; then
+            echo "stale lock (holder pid dead), stealing" >&2; rm -rf "$lp"
+          elif is_parked "$lp"; then
+            # The reason carries the state the hardware was left in. Print it in FULL and
+            # to stdout, not stderr: it is the handover note, not a diagnostic.
+            echo "taking over a PARKED lock, held $(age_str $(( $(date +%s) - $(park_since "$lp") ))) by pid $(holder_pid "$lp")"
+            echo "  parked because: $(park_reason "$lp")"
+            echo "  its last note:  $(read_note "$lp")"
+            rm -rf "$lp"
+          fi
           rmdir "$lp.steal" 2>/dev/null
           continue
         fi
@@ -356,6 +390,40 @@ case "$cmd" in
       [ "$(date +%s)" -ge "$deadline" ] && { echo "TIMEOUT waiting for $name after ${timeout}s"; exit 1; }
       sleep 2
     done ;;
+  run)
+    # acquire (blocking), run a command, release NO MATTER HOW WE LEAVE. This is the only
+    # shape in which forgetting to release is impossible, and it is the one to reach for:
+    #   lock.sh run rig "flashing" -- ./flash.sh 30
+    #   lock.sh run rig "flashing" --timeout 1800 -- ./flash.sh 30
+    # The exit status is the COMMAND's, never the launcher's. That matters because the
+    # documented way to wait was "run `wait` in the background", and a backgrounded launch
+    # returns 0 immediately -- so an agent reads 0, believes it holds the lock, and touches
+    # the hardware anyway. Measured 2026-09-14.
+    sanitize "$name"
+    shift 2 || true
+    runnote=""; runto=3600
+    if [ "${1:-}" != "--" ] && [ "${1:-}" != "--timeout" ]; then runnote=$(clean_note "${1:-}"); shift || true; fi
+    if [ "${1:-}" = "--timeout" ]; then runto=${2:-3600}; shift 2 || true; fi
+    [ "${1:-}" = "--" ] || { echo "usage: lock.sh run <name> \"note\" [--timeout S] -- <command...>" >&2; exit 2; }
+    shift
+    [ "$#" -gt 0 ] || { echo "usage: lock.sh run <name> \"note\" [--timeout S] -- <command...>" >&2; exit 2; }
+    # Resolve first so the trap releases the same name acquire took.
+    resolve "$name" || CANON=$name
+    runcanon=$CANON
+    "$0" wait "$runcanon" "$runnote" "$runto" || { echo "run: never acquired $runcanon, command NOT started" >&2; exit 2; }
+    # From here the lock is ours and must come back on every path: normal exit, a failing
+    # command, or a signal. Without the signal traps a Ctrl-C or a harness timeout leaks it,
+    # which is the exact failure this subcommand exists to remove.
+    released=no
+    release_once() { [ "$released" = yes ] && return 0; released=yes; "$0" release "$runcanon" >/dev/null 2>&1; }
+    trap 'release_once; exit 130' INT
+    trap 'release_once; exit 143' TERM
+    trap 'release_once' EXIT
+    "$@"; runrc=$?
+    release_once
+    trap - INT TERM EXIT
+    echo "RELEASED $runcanon (lock.sh run; command exit $runrc)" >&2
+    exit $runrc ;;
   note)
     sanitize "$name"; canon_or_literal "$name"; canon=$CANON; lp=$(lockpath "$canon")
     new=$(clean_note "${3:-}")
@@ -369,6 +437,30 @@ case "$cmd" in
     fi
     set_note "$lp" "$new" || exit 2
     echo "NOTE UPDATED $canon: $new" ;;
+  park)
+    # the holder declares it is done with the resource but cannot release yet (waiting on
+    # a human, keeping the board powered for a follow-up). Others may then take it.
+    sanitize "$name"; canon_or_literal "$name"; canon=$CANON; lp=$(lockpath "$canon")
+    reason=$(clean_note "${3:-}")
+    [ -n "$reason" ] || { echo "usage: lock.sh park <name> \"why you are parked / what state the hardware is in\"" >&2; exit 2; }
+    [ -d "$lp" ] || { echo "not locked: $canon (nothing to park)" >&2; exit 2; }
+    me=$(owner_pid); hp=$(holder_pid "$lp")
+    # Only the holder may park. Parking someone else's lock would be stealing it by proxy,
+    # which is the exact thing the steal rules exist to prevent.
+    [ "$hp" = "$me" ] && [ "$me" != unknown ] || {
+      echo "refusing: $canon is held by pid ${hp:-?}, not by this session (pid $me)." >&2
+      echo "Only the holder may park a lock; it is a handover, not a seizure." >&2; exit 1; }
+    printf '%s\n%s\n' "$(date +%s)" "$reason" > "$(parkpath "$lp")" || exit 2
+    echo "PARKED $canon: $reason"
+    echo "It stays yours until someone takes it; 'lock.sh unpark $canon' cancels, 'release' still works." ;;
+  unpark)
+    sanitize "$name"; canon_or_literal "$name"; canon=$CANON; lp=$(lockpath "$canon")
+    [ -d "$lp" ] || { echo "not locked: $canon" >&2; exit 2; }
+    me=$(owner_pid); hp=$(holder_pid "$lp")
+    [ "$hp" = "$me" ] && [ "$me" != unknown ] || {
+      echo "refusing: $canon is held by pid ${hp:-?}, not this session (pid $me)" >&2; exit 1; }
+    is_parked "$lp" || { echo "$canon is not parked"; exit 0; }
+    rm -f "$(parkpath "$lp")"; echo "UNPARKED $canon (it is a normal held lock again)" ;;
   flag)
     sanitize "$name"; canon_or_literal "$name"; canon=$CANON; fp=$(flagpath "$canon")
     reason=$(clean_note "${3:-}")
@@ -413,7 +505,7 @@ case "$cmd" in
     fi
     if [ -d "$lp" ]; then
       holder_dead "$lp" && echo "HELD $canon [stale — holder pid dead]" \
-        || echo "HELD $canon$(idle_note "$lp")"
+        || echo "HELD $canon$(park_note "$lp")$(idle_note "$lp")"
       show "$lp"; exit 1
     fi
     # A non-directory at the lock path is not "free": something occupies the name and we
@@ -428,7 +520,7 @@ case "$cmd" in
     for lp in "$DIR"/*.lock; do
       [ -d "$lp" ] || continue; found=1
       n=$(basename "$lp" .lock)
-      holder_dead "$lp" && s=stale || s=held
+      holder_dead "$lp" && s=stale || { is_parked "$lp" && s=parked || s=held; }
       if [ -r "$lp/info" ]; then
         echo "$n [$s]: $(tr '\n' ' ' < "$lp/info" 2>/dev/null)"
       else
@@ -449,6 +541,6 @@ case "$cmd" in
   *)
     echo "usage: lock.sh acquire <name> [note] [--new] [--ack] [--brief] | release <name> [--force]" >&2
     echo "       lock.sh note <name> \"text\" [--force] | flag <name> \"reason\" | unflag <name>" >&2
-    echo "       lock.sh status <name> | list | resolve <name> | wait <name> [note] [timeout]" >&2
+    echo "       lock.sh status <name> | list | resolve <name> | wait <name> [note] [timeout]\n       lock.sh park <name> \"reason\" | unpark <name>\n       lock.sh run <name> \"note\" [--timeout S] -- <command...>   # acquire, run, ALWAYS release" >&2
     exit 2 ;;
 esac

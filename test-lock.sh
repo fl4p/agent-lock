@@ -307,6 +307,84 @@ rm -f "$lp/info"
 out=$("$L" status scope 2>&1); rc=$?
 check "status survives a lock with no info file" 1 "$rc" "$out"
 
+echo "== 24. park: the holder hands a lock over; nothing else may take it =="
+fresh
+# A lock we hold ourselves: park is a declaration by the holder, so we must be it.
+out=$("$L" acquire scope "flashing" 2>&1); rc=$?
+check "acquire for the park tests" 0 "$rc" "$out"
+out=$("$L" park scope "done with the board, waiting on Fab for the antenna" 2>&1); rc=$?
+check "the holder may park its own lock" 0 "$rc" "$out"
+out=$("$L" status scope 2>&1)
+case "$out" in *PARKED*) ok "status says PARKED, so nobody waits for nothing" ;;
+              *) bad "status says PARKED (got: $out)" ;; esac
+case "$("$L" list 2>&1)" in *"[parked]"*) ok "list marks it parked" ;;
+              *) bad "list marks it parked" ;; esac
+# The handover: the reason and the outgoing note must reach the taker, because the
+# hardware's physical state lives in them.
+lp="$AGENT_LOCK_DIR/scope.lock"
+sed -i '' 's/^pid=.*/pid=1/' "$lp/info" 2>/dev/null || sed -i 's/^pid=.*/pid=1/' "$lp/info"
+out=$("$L" acquire scope "taking over" 2>&1); rc=$?
+check "a PARKED lock held by a LIVE pid IS takeable" 0 "$rc" "$out"
+case "$out" in *"waiting on Fab for the antenna"*) ok "the taker is told why it was parked" ;;
+              *) bad "the taker is told why it was parked (got: $out)" ;; esac
+case "$out" in *"flashing"*) ok "the taker is told the outgoing note (hardware state)" ;;
+              *) bad "the taker is told the outgoing note (got: $out)" ;; esac
+# KNOWN-BAD CALIBRATION: the same lock, live pid, NOT parked, must stay untakeable.
+# If this passes, park has quietly become a timeout and the whole steal policy is gone.
+fresh
+lp="$AGENT_LOCK_DIR/scope.lock"; mkdir -p "$lp"
+printf 'resource=scope\npid=1\nuser=peer\nsince=x\nnote=peer is using it\n' > "$lp/info"
+out=$("$L" acquire scope "mine" 2>&1); rc=$?
+check "an UNPARKED lock held by a live pid is still NOT takeable" 1 "$rc" "$out"
+# Parking someone else's lock would be a seizure by proxy.
+out=$("$L" park scope "not mine to park" 2>&1); rc=$?
+check "parking a lock we do NOT hold is REFUSED" 1 "$rc" "$out"
+out=$("$L" acquire scope "mine" 2>&1); rc=$?
+check "...and the refused park did not make it takeable" 1 "$rc" "$out"
+# park needs a reason: an empty one would hand over the board with no state description.
+fresh
+"$L" acquire scope "held" >/dev/null 2>&1
+out=$("$L" park scope "" 2>&1); rc=$?
+check "park with no reason is REFUSED" 2 "$rc" "$out"
+out=$("$L" unpark scope 2>&1); rc=$?
+check "unpark on an unparked lock is harmless" 0 "$rc" "$out"
+"$L" park scope "parked" >/dev/null 2>&1
+out=$("$L" unpark scope 2>&1); rc=$?
+check "unpark cancels the handover" 0 "$rc" "$out"
+sed -i '' 's/^pid=.*/pid=1/' "$AGENT_LOCK_DIR/scope.lock/info" 2>/dev/null || true
+out=$("$L" acquire scope "mine" 2>&1); rc=$?
+check "...and an unparked lock is NOT takeable again" 1 "$rc" "$out"
+
+echo "== 25. run: acquire, work, ALWAYS release =="
+fresh
+out=$("$L" run scope "working" -- /bin/echo hello 2>&1); rc=$?
+check "run returns the command's success" 0 "$rc" "$out"
+case "$out" in *hello*) ok "the command actually ran" ;; *) bad "the command actually ran" ;; esac
+out=$("$L" status scope 2>&1); rc=$?
+check "the lock came back after a normal exit" 0 "$rc" "$out"
+# The whole point: the status must be the COMMAND's. The old documented pattern was to
+# background `wait`, whose launch returns 0 regardless, so an agent read 0 and touched the
+# hardware without the lock.
+"$L" run scope "working" -- /bin/sh -c 'exit 42' >/dev/null 2>&1; rc=$?
+check "run propagates the command's exit status, not its own" 42 "$rc" ""
+out=$("$L" status scope 2>&1); rc=$?
+check "the lock came back after a FAILING command" 0 "$rc" "$out"
+"$L" run scope "working" -- /bin/sh -c 'kill -9 $$' >/dev/null 2>&1
+out=$("$L" status scope 2>&1); rc=$?
+check "the lock came back after the command was KILLED" 0 "$rc" "$out"
+# KNOWN-BAD CALIBRATION: if the lock is never acquired the command must NOT run. A wrapper
+# that runs the work anyway is worse than no wrapper, because it looks like serialisation.
+fresh
+lp="$AGENT_LOCK_DIR/scope.lock"; mkdir -p "$lp"
+printf 'resource=scope\npid=1\nuser=peer\nsince=x\nnote=peer is using it\n' > "$lp/info"
+out=$("$L" run scope "mine" --timeout 4 -- /bin/echo SHOULD_NOT_RUN 2>&1); rc=$?
+check "run REFUSES when the lock never comes free" 2 "$rc" "$out"
+case "$out" in *SHOULD_NOT_RUN*) bad "the command must NOT run without the lock" ;;
+              *) ok "the command must NOT run without the lock" ;; esac
+# ...and it must not have stolen the peer's lock on the way out.
+out=$("$L" status scope 2>&1); rc=$?
+check "the peer still holds it afterwards" 1 "$rc" "$out"
+
 echo
 echo "passed $pass, failed $fail"
 [ "$fail" = 0 ] || exit 1
