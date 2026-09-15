@@ -437,5 +437,24 @@ case "$out" in *"needs the bench"*) ok "  ...and carries the requester's note" ;
 out=$("$L" wanted scope 2>&1); rc=$?
 check "release clears the request, so the handover is not served twice" 1 "$rc" "$out"
 
+echo "== 29. AGENT_LOCK_OWNER_PID: a detached daemon can own its own lock =="
+# The 2026-09-15 known-bad. nohup reparents a daemon to launchd, so the ancestry walk in
+# owner_pid finds no agent and returns "unknown" -- and every ownership test then fails
+# closed against a lock the daemon really holds. Two 9-hour soaks each stopped ~60 s in,
+# logging "lost the lock to another session" about locks they held, then spun unable to
+# re-acquire. A long-lived holder must be able to name itself.
+rm -rf "$AGENT_LOCK_DIR"/scope.lock
+( AGENT_LOCK_OWNER_PID=$$ "$L" acquire scope "detached" >/dev/null 2>&1 )
+hp=$(sed -n 's/^pid=//p' "$AGENT_LOCK_DIR/scope.lock/info" 2>/dev/null)
+AGENT_LOCK_OWNER_PID=$hp "$L" mine scope --quiet; rc=$?
+check "mine ACCEPTS when the holder names itself via AGENT_LOCK_OWNER_PID" 0 "$rc" ""
+out=$(env -u AGENT_LOCK_OWNER_PID "$L" mine scope 2>&1); rc=$?
+check "  ...and still fails closed without it (the old, broken reading)" 1 "$rc" "$out"
+# a dead pid must never read as ours, or the override becomes a way to steal any lock
+dead=99999; while kill -0 $dead 2>/dev/null; do dead=$((dead+1)); done
+out=$(AGENT_LOCK_OWNER_PID=$dead "$L" mine scope 2>&1); rc=$?
+check "  ...and a DEAD override pid is refused, not honoured" 1 "$rc" "$out"
+rm -rf "$AGENT_LOCK_DIR"/scope.lock
+
 echo "passed $pass, failed $fail"
 [ "$fail" = 0 ] || exit 1

@@ -138,6 +138,19 @@ canon_or_literal() { # inspect/repair path: sets CANON. A lock that exists on di
 
 # --- ownership ---------------------------------------------------------------------
 owner_pid() { # walk ancestry to the long-lived agent process; "unknown" if none
+  # A DETACHED daemon has no agent ancestor -- nohup reparents it to launchd/init -- so the
+  # walk below returns "unknown" and every ownership test fails closed. That is right for a
+  # stray process and wrong for a long-running holder, which is exactly who needs `mine`:
+  # on 2026-09-15 two 9-hour soaks each stopped ~60 s in, reporting "lost the lock to another
+  # session" about locks they held, and then spun forever unable to re-acquire.
+  # A daemon that IS the long-lived process names itself:
+  #     export AGENT_LOCK_OWNER_PID=$$
+  # Its own pid is stable for its lifetime and dies with it, so the lock still reads stale
+  # the moment it exits -- the property the ancestry walk was protecting.
+  if [ -n "${AGENT_LOCK_OWNER_PID:-}" ]; then
+    if ps -p "$AGENT_LOCK_OWNER_PID" -o pid= >/dev/null 2>&1; then echo "$AGENT_LOCK_OWNER_PID"; return
+    else echo unknown; return; fi     # a dead pid must never read as ours
+  fi
   local pid=$$ comm
   while :; do
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
