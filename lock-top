@@ -1,0 +1,1137 @@
+#!/usr/bin/env python3
+"""
+lock-top - Live responsive terminal monitor for agent resource locks.
+
+Monitors named resource locks in /tmp/claude-locks (or $AGENT_LOCK_DIR).
+Shows who is holding each lock, for how long, why (note), port activity, and status.
+Responsively adapts between compact card layout (< 80 cols) and wide tabular layout (>= 80 cols).
+Refreshes every 5 seconds by default.
+"""
+
+import os
+import sys
+import time
+import signal
+import argparse
+import subprocess
+import re
+import glob
+import textwrap
+import shutil
+import json
+from datetime import datetime
+
+# ANSI styling
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+ITALIC = "\033[3m"
+UNDERLINE = "\033[4m"
+
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+MAGENTA = "\033[35m"
+CYAN = "\033[36m"
+WHITE = "\033[37m"
+
+BG_RED = "\033[41m"
+BG_GREEN = "\033[42m"
+
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def strip_ansi(s: str) -> str:
+    """Remove ANSI escape sequences to compute true visible width."""
+    return ANSI_RE.sub("", s)
+
+
+def visible_len(s: str) -> int:
+    """Compute visible length of string ignoring ANSI escape codes."""
+    return len(strip_ansi(s))
+
+
+def get_terminal_width() -> int:
+    """Get terminal width safely."""
+    try:
+        return shutil.get_terminal_size((80, 24)).columns
+    except Exception:
+        return 80
+
+
+def format_duration(seconds: float) -> str:
+    """Format duration into compact human-readable string."""
+    s = int(seconds)
+    if s < 0:
+        return "0s"
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h {m:02d}m"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h"
+
+
+def shorten_path(path: str, max_w: int = 40) -> str:
+    """Replace home directory with ~ and truncate leading segments if too wide."""
+    if not path:
+        return ""
+    home = os.path.expanduser("~")
+    if path.startswith(home):
+        path = "~" + path[len(home):]
+    if len(path) <= max_w:
+        return path
+    return "..." + path[-(max_w - 3):]
+
+
+def make_labeled_line(name: str, text: str, width: int, text_style: str = ""):
+    """Format an indented labeled line with consistent 10-char column alignment."""
+    if not text:
+        return []
+    clean_text = text.replace("\n", " ").strip()
+    lbl_plain = f"  {name:<7} "  # 10 chars total
+    indent = " " * 10
+    max_w = max(20, width)
+    wrapper = textwrap.TextWrapper(width=max_w, initial_indent=lbl_plain, subsequent_indent=indent)
+    plain_wrapped = wrapper.fill(clean_text)
+    out = []
+    for i, line in enumerate(plain_wrapped.splitlines()):
+        if i == 0:
+            val = line[10:]
+            out.append(f"  {DIM}{name:<7}{RESET} {text_style}{val}{RESET}")
+        else:
+            val = line[10:]
+            out.append(f"{indent}{text_style}{val}{RESET}")
+    return out
+
+
+def parse_registry(aliases_path: str):
+    """Parse aliases.conf into {canonical: [aliases]} and banned set."""
+    registry = {}
+    banned = {}
+    if not os.path.exists(aliases_path):
+        return registry, banned
+
+    try:
+        with open(aliases_path, "r", errors="replace") as f:
+            for line in f:
+                line = line.split("#")[0].strip()
+                if not line or ":" not in line:
+                    continue
+                canon, rest = line.split(":", 1)
+                canon = canon.strip()
+                if not canon:
+                    continue
+                if canon.startswith("!"):
+                    banned[canon[1:]] = rest.strip()
+                    continue
+                aliases = [a.strip() for a in rest.split() if a.strip()]
+                registry[canon] = aliases
+    except Exception:
+        pass
+    return registry, banned
+
+
+def get_generic_usb_devices():
+    """Scan ioreg for all connected USB serial devices and extract device info."""
+    devices = []
+    try:
+        out = subprocess.run(
+            ["ioreg", "-l", "-w", "0"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        ).stdout
+        curr = {}
+        for line in out.splitlines():
+            m_dev = re.search(r'"IOCalloutDevice" = "([^"]+)"', line)
+            if m_dev:
+                curr["callout"] = m_dev.group(1)
+            m_sn = re.search(r'"USB Serial Number" = "([^"]+)"', line)
+            if m_sn:
+                curr["serial"] = m_sn.group(1).strip()
+            m_prod = re.search(r'"USB Product Name" = "([^"]+)"', line)
+            if m_prod:
+                curr["product"] = m_prod.group(1).strip()
+            m_vendor = re.search(r'"USB Vendor Name" = "([^"]+)"', line)
+            if m_vendor:
+                curr["vendor"] = m_vendor.group(1).strip()
+
+            if "callout" in curr and ("serial" in curr or "product" in curr):
+                if "usbmodem" in curr["callout"] or "usbserial" in curr["callout"]:
+                    devices.append(curr)
+                curr = {}
+    except Exception:
+        pass
+    return devices
+
+
+def get_port_openers():
+    """Check which processes currently have /dev/cu.usb* open using lsof."""
+    openers = {}
+    devs = glob.glob("/dev/cu.usb*")
+    if not devs:
+        return openers
+    try:
+        res = subprocess.run(
+            ["lsof", "-F", "pucn"] + devs,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        curr_p = None
+        curr_u = None
+        curr_c = None
+        for line in res.stdout.splitlines():
+            if line.startswith("p"):
+                curr_p = line[1:]
+            elif line.startswith("u"):
+                curr_u = line[1:]
+            elif line.startswith("c"):
+                curr_c = line[1:]
+            elif line.startswith("n"):
+                dev_node = line[1:]
+                openers.setdefault(dev_node, []).append((curr_p, curr_u, curr_c))
+    except Exception:
+        pass
+    return openers
+
+
+def match_usb_device(canon: str, aliases: list, usb_devs: list):
+    """Match a resource name or alias to a USB serial device."""
+    names = [canon] + aliases
+    for d in usb_devs:
+        sn = d.get("serial", "")
+        sn_clean = re.sub(r"[^a-zA-Z0-9]", "", sn).lower()
+        if not sn_clean:
+            continue
+        for n in names:
+            n_clean = re.sub(r"[^a-zA-Z0-9]", "", n).lower()
+            if not n_clean:
+                continue
+            # Full match or MAC 4-character hex suffix match (e.g. esp32s3-ad38 -> AD:38)
+            if sn_clean == n_clean:
+                return d
+            if len(sn_clean) >= 4 and n_clean.endswith(sn_clean[-4:]):
+                return d
+            if len(n_clean) >= 4 and sn_clean.endswith(n_clean[-4:]):
+                return d
+    return None
+
+
+def get_local_project_board_hints():
+    """Optionally load friendly names from docs/boards.md or tests/fpsgate.json if in project."""
+    hints = {}
+    try:
+        if os.path.exists("tests/fpsgate.json"):
+            data = json.load(open("tests/fpsgate.json"))
+            for bkey, bval in data.get("boards", {}).items():
+                lkey = bval.get("lock")
+                if lkey:
+                    hints[lkey] = {"label": bkey, "desc": bval.get("_", "")}
+    except Exception:
+        pass
+
+    try:
+        if os.path.exists("docs/boards.md"):
+            with open("docs/boards.md") as f:
+                for line in f:
+                    m = re.search(r"\|\s*\*\*([^*]+)\*\*\s*\|\s*`([^`]+)`\s*\|\s*`([^`]+)`\s*\|", line)
+                    if m:
+                        label, mac, lk = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+                        hints[lk] = {"label": label, "mac": mac}
+    except Exception:
+        pass
+
+    return hints
+
+
+def is_descendant_of(child_pid_str, parent_pid_str):
+    """Check if child_pid is equal to or a descendant of parent_pid, safely handling timeouts and errors."""
+    curr = str(child_pid_str).strip()
+    target = str(parent_pid_str).strip()
+    if not curr or not target:
+        return False
+    if curr == target:
+        return True
+    visited = set()
+    try:
+        while curr and curr != "1" and curr != "0" and curr not in visited:
+            visited.add(curr)
+            res = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", curr],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            ppid = res.stdout.strip()
+            if not ppid or not ppid.isdigit():
+                break
+            if ppid == target:
+                return True
+            curr = ppid
+    except Exception:
+        return False
+    return False
+
+
+def verify_ps_works() -> bool:
+    """Verify ps answers for our own process; matches lock.sh's control check."""
+    try:
+        res = subprocess.run(
+            ["ps", "-p", str(os.getpid()), "-o", "pid="],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        return res.returncode == 0 and res.stdout.strip() == str(os.getpid())
+    except Exception:
+        return False
+
+
+def get_process_details(pid_str):
+    """
+    Retrieve process liveness, args, cwd, and short agent label.
+    Follows lock.sh's rule: only declare DEAD if ps is provably functional and returns empty.
+    If ps cannot answer, fails, or times out, fail-closed (assume ALIVE / UNVERIFIED).
+    """
+    try:
+        pid = int(pid_str)
+    except (ValueError, TypeError):
+        return True, {"pid": pid_str, "status": "UNKNOWN (invalid pid)"}
+
+    # Control test: if ps doesn't work for self, don't condemn the holder
+    if not verify_ps_works():
+        return True, {"pid": pid, "status": "ALIVE (ps unverified)"}
+
+    try:
+        res = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "pid=,stat=,args="],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        # ps succeeded and output is empty: provably dead
+        if res.returncode == 0 and not res.stdout.strip():
+            return False, {"pid": pid, "status": "DEAD"}
+
+        # ps returned non-zero with empty stdout: ps says pid not found -> dead
+        if res.returncode != 0 and not res.stdout.strip() and not res.stderr.strip():
+            return False, {"pid": pid, "status": "DEAD"}
+
+        # ps threw error (e.g. permission denied) -> fail closed (assume alive)
+        if res.returncode != 0:
+            return True, {"pid": pid, "status": "ALIVE (unverified)"}
+
+        line = res.stdout.strip()
+        parts = line.split(None, 2)
+        stat = parts[1] if len(parts) > 1 else ""
+        args = parts[2] if len(parts) > 2 else ""
+
+        cmd_tokens = args.split()
+        exe = os.path.basename(cmd_tokens[0]) if cmd_tokens else ""
+
+        agent_label = exe
+        m_resume = re.search(r"--resume[= ]([a-f0-9-]+)", args)
+        if m_resume:
+            agent_label += f" [{m_resume.group(1)[:8]}]"
+        elif "claude" in exe or "claude" in args:
+            m_caller = re.search(r"callerAgentId=([a-f0-9-]+)", args)
+            if m_caller:
+                agent_label += f" [{m_caller.group(1)[:8]}]"
+
+        cwd = None
+        try:
+            lsof_cwd = subprocess.run(
+                ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            for ln in lsof_cwd.stdout.splitlines():
+                if ln.startswith("n"):
+                    cwd = ln[1:]
+                    break
+        except Exception:
+            pass
+
+        child_summary = None
+        try:
+            pg = subprocess.run(
+                ["pgrep", "-P", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            child_pids = [p for p in pg.stdout.split() if p.isdigit()]
+            if child_pids:
+                ps_c = subprocess.run(
+                    ["ps", "-p", child_pids[-1], "-o", "args="],
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                )
+                c_args = ps_c.stdout.strip()
+                if c_args:
+                    m_eval = re.search(r"eval '(.*?)'", c_args)
+                    if m_eval:
+                        raw_inner = m_eval.group(1).split("&&")[-1].strip()
+                        c_clean = raw_inner
+                    else:
+                        c_clean = c_args.split("\n")[0]
+                    c_clean = re.sub(r"source /Users/.*?shell-snapshots/.*?\.sh", "", c_clean).strip()
+                    c_clean = re.sub(r"^/bin/zsh -c\s*", "", c_clean).strip()
+                    c_clean = re.sub(r"^/bin/bash -c\s*", "", c_clean).strip()
+                    if len(c_clean) > 80:
+                        c_clean = c_clean[:77] + "..."
+                    child_summary = f"{c_clean} (PID {child_pids[-1]})" if c_clean else f"PID {child_pids[-1]}"
+        except Exception:
+            pass
+
+        return True, {
+            "pid": pid,
+            "stat": stat,
+            "exe": exe,
+            "args": args,
+            "label": agent_label,
+            "cwd": cwd,
+            "child": child_summary,
+        }
+    except Exception as e:
+        # On any exception, fail closed: assume alive
+        return True, {"pid": pid, "status": "ALIVE (unverified)", "error": str(e), "label": f"PID {pid}"}
+
+
+def parse_lock_file(lock_dir):
+    """Parse info and parked status inside a .lock directory."""
+    info = {}
+    info_path = os.path.join(lock_dir, "info")
+    info_mtime = None
+    if os.path.exists(info_path):
+        try:
+            info_mtime = os.path.getmtime(info_path)
+            with open(info_path, "r", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        info[k.strip()] = v.strip()
+        except Exception:
+            pass
+
+    parked = None
+    parked_path = os.path.join(lock_dir, "parked")
+    if os.path.exists(parked_path):
+        try:
+            with open(parked_path, "r", errors="replace") as f:
+                lines = f.read().splitlines()
+                p_epoch = float(lines[0]) if lines and lines[0].isdigit() else os.path.getmtime(parked_path)
+                p_reason = "\n".join(lines[1:]) if len(lines) > 1 else "(no reason)"
+                parked = {"epoch": p_epoch, "reason": p_reason}
+        except Exception:
+            pass
+
+    return info, info_mtime, parked
+
+
+def parse_flag_file(flag_path):
+    """Parse a .flag file."""
+    flag = {}
+    try:
+        with open(flag_path, "r", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    flag[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return flag
+
+
+def collect_data(lock_dir: str, aliases_path: str, show_all: bool = False, query: str = ""):
+    """Gather full status for all resources and locks dynamically."""
+    if not os.path.isdir(lock_dir):
+        return [], [], f"Store directory missing or unreadable: {lock_dir}"
+
+    registry, banned = parse_registry(aliases_path)
+    usb_devs = get_generic_usb_devices()
+    port_openers = get_port_openers()
+    project_hints = get_local_project_board_hints()
+
+    now = time.time()
+    all_lock_dirs = glob.glob(os.path.join(lock_dir, "*.lock"))
+    all_flag_files = glob.glob(os.path.join(lock_dir, "*.flag"))
+
+    lock_map = {}
+    for ld in all_lock_dirs:
+        lname = os.path.basename(ld)[:-5]
+        info, mtime, parked = parse_lock_file(ld)
+        lock_map[lname] = {"path": ld, "info": info, "mtime": mtime, "parked": parked}
+
+    flag_map = {}
+    for ff in all_flag_files:
+        fname = os.path.basename(ff)[:-5]
+        flag_map[fname] = {"path": ff, "flag": parse_flag_file(ff)}
+
+    alias_to_canon = {}
+    for canon, alist in registry.items():
+        for a in alist:
+            alias_to_canon[a] = canon
+
+    resources_to_show = []
+    handled_canon = set()
+
+    # 1. Registered resources
+    for canon, alist in registry.items():
+        usb_match = match_usb_device(canon, alist, usb_devs)
+        hint = project_hints.get(canon, {})
+
+        # Find ALL active locks that exist for this canonical resource and its aliases
+        matching_lock_keys = []
+        for candidate in [canon] + alist:
+            if candidate in lock_map:
+                matching_lock_keys.append(candidate)
+
+        active_flag = flag_map.get(canon)
+        is_active = (len(matching_lock_keys) > 0) or (active_flag is not None)
+        has_hw = (usb_match is not None)
+
+        include = False
+        if show_all:
+            include = True
+        elif is_active:
+            include = True
+        elif has_hw:
+            include = True
+
+        if query:
+            q_lower = query.lower()
+            text_haystack = f"{canon} {' '.join(alist)} {hint.get('label', '')} {hint.get('desc', '')}".lower()
+            if q_lower not in text_haystack:
+                include = False
+
+        if not include:
+            continue
+
+        handled_canon.add(canon)
+        for k in matching_lock_keys:
+            handled_canon.add(k)
+
+        curr_port = usb_match["callout"] if usb_match else None
+        port_open = port_openers.get(curr_port, []) if curr_port else []
+        hw_serial = usb_match.get("serial", "") if usb_match else hint.get("mac", "")
+        label = hint.get("label", canon)
+
+        # Handle split lock conflict (both canonical and alias held simultaneously!)
+        is_split_collision = len(matching_lock_keys) > 1
+
+        if matching_lock_keys:
+            # If split collision, render all holders
+            for active_lock_key in matching_lock_keys:
+                lock_entry = lock_map[active_lock_key]
+                info = lock_entry["info"]
+                mtime = lock_entry["mtime"]
+                parked = lock_entry["parked"]
+
+                pid_str = info.get("pid", "unknown")
+                user = info.get("user", "unknown")
+                note = info.get("note", "(no note)")
+                since_str = info.get("since", "")
+
+                duration_s = 0.0
+                if since_str:
+                    try:
+                        dt = datetime.strptime(since_str, "%Y-%m-%d %H:%M:%S")
+                        duration_s = (datetime.now() - dt).total_seconds()
+                    except Exception:
+                        duration_s = now - mtime if mtime else 0.0
+                elif mtime:
+                    duration_s = now - mtime
+
+                idle_s = (now - mtime) if mtime else 0.0
+                is_idle = idle_s >= 600
+
+                is_alive, proc_info = get_process_details(pid_str)
+
+                if not is_alive and pid_str != "unknown":
+                    status = "STALE"
+                elif parked:
+                    status = "PARKED"
+                else:
+                    status = "HELD"
+
+                if is_split_collision:
+                    status = f"CONFLICT [{status}]"
+
+                if active_flag:
+                    status += " [FLAGGED]"
+
+                resources_to_show.append({
+                    "resource": canon,
+                    "label": label,
+                    "lock_key": active_lock_key,
+                    "is_alias": active_lock_key != canon,
+                    "is_split": is_split_collision,
+                    "status": status,
+                    "port": curr_port,
+                    "serial": hw_serial,
+                    "port_open": port_open,
+                    "user": user,
+                    "pid": pid_str,
+                    "proc": proc_info,
+                    "since": since_str,
+                    "duration_s": duration_s,
+                    "idle_s": idle_s if is_idle else 0.0,
+                    "note": note,
+                    "parked": parked,
+                    "flag": active_flag["flag"] if active_flag else None,
+                    "has_hw": has_hw,
+                })
+        else:
+            if active_flag:
+                status = "FLAGGED"
+                note = active_flag["flag"].get("reason", "")
+                user = active_flag["flag"].get("by", "")
+            else:
+                status = "FREE"
+                note = ""
+                user = ""
+
+            resources_to_show.append({
+                "resource": canon,
+                "label": label,
+                "lock_key": canon,
+                "is_alias": False,
+                "is_split": False,
+                "status": status,
+                "port": curr_port,
+                "serial": hw_serial,
+                "port_open": port_open,
+                "user": user,
+                "pid": "",
+                "proc": None,
+                "since": "",
+                "duration_s": 0.0,
+                "idle_s": 0.0,
+                "note": note,
+                "parked": None,
+                "flag": active_flag["flag"] if active_flag else None,
+                "has_hw": has_hw,
+            })
+
+    # 2. Unregistered or other active locks in lock_dir
+    unregistered_locks = []
+    for lname, lentry in lock_map.items():
+        canon = alias_to_canon.get(lname, lname)
+        if canon in handled_canon or lname in handled_canon:
+            continue
+
+        if query and query.lower() not in lname.lower() and query.lower() not in lentry["info"].get("note", "").lower():
+            continue
+
+        info = lentry["info"]
+        mtime = lentry["mtime"]
+        parked = lentry["parked"]
+        pid_str = info.get("pid", "unknown")
+        user = info.get("user", "unknown")
+        note = info.get("note", "(no note)")
+        since_str = info.get("since", "")
+
+        duration_s = 0.0
+        if since_str:
+            try:
+                dt = datetime.strptime(since_str, "%Y-%m-%d %H:%M:%S")
+                duration_s = (datetime.now() - dt).total_seconds()
+            except Exception:
+                duration_s = now - mtime if mtime else 0.0
+
+        is_alive, proc_info = get_process_details(pid_str)
+        if not is_alive and pid_str != "unknown":
+            status = "STALE"
+        elif parked:
+            status = "PARKED"
+        else:
+            status = "HELD"
+
+        flag_entry = flag_map.get(lname)
+        unregistered_locks.append({
+            "resource": lname,
+            "label": lname,
+            "lock_key": lname,
+            "is_alias": False,
+            "is_split": False,
+            "status": status,
+            "port": None,
+            "serial": "",
+            "port_open": [],
+            "user": user,
+            "pid": pid_str,
+            "proc": proc_info,
+            "since": since_str,
+            "duration_s": duration_s,
+            "idle_s": 0.0,
+            "note": note,
+            "parked": parked,
+            "flag": flag_entry["flag"] if flag_entry else None,
+            "has_hw": False,
+        })
+
+    for fname, fentry in flag_map.items():
+        canon = alias_to_canon.get(fname, fname)
+        if canon in handled_canon or fname in handled_canon or any(u["resource"] == fname for u in unregistered_locks):
+            continue
+        if query and query.lower() not in fname.lower() and query.lower() not in fentry["flag"].get("reason", "").lower():
+            continue
+
+        flag_data = fentry["flag"]
+        unregistered_locks.append({
+            "resource": fname,
+            "label": fname,
+            "lock_key": fname,
+            "is_alias": False,
+            "is_split": False,
+            "status": "FLAGGED",
+            "port": None,
+            "serial": "",
+            "port_open": [],
+            "user": flag_data.get("by", ""),
+            "pid": "",
+            "proc": None,
+            "since": flag_data.get("flagged", ""),
+            "duration_s": 0.0,
+            "idle_s": 0.0,
+            "note": flag_data.get("reason", ""),
+            "parked": None,
+            "flag": flag_data,
+            "has_hw": False,
+        })
+
+    return resources_to_show, unregistered_locks, None
+
+
+def render_compact(items, unregistered, lock_dir: str, interval: int, count: int, width: int, query: str = "", error_msg: str = None) -> str:
+    """Render compact card/block layout for narrow terminals (< 80 columns)."""
+    now_str = datetime.now().strftime("%H:%M:%S")
+
+    lines = []
+    filter_tag = f" {CYAN}[filter: {query}]{RESET}" if query else ""
+    lines.append(f"{BOLD}{CYAN}══ RESOURCE LOCK MONITOR ══{RESET}{filter_tag} {DIM}[{now_str}]{RESET}")
+
+    if error_msg:
+        lines.append(f"{BOLD}{RED}{error_msg}{RESET}")
+        lines.append("─" * width)
+        return "\n".join(lines)
+
+    all_items = items + unregistered
+    num_held = sum(1 for b in all_items if any(s in b["status"] for s in ("HELD", "PARKED", "STALE", "CONFLICT")))
+    num_free = sum(1 for b in all_items if "FREE" in b["status"])
+
+    lines.append(f"{BOLD}{GREEN}{num_free} FREE{RESET}{DIM} · {BOLD}{RED if num_held else GREEN}{num_held} HELD{RESET}{DIM} · every {interval}s{RESET}")
+    lines.append("─" * width)
+
+    if not all_items:
+        lines.append(f"{DIM}No matching resources or active locks found.{RESET}")
+
+    for b in items:
+        st = b["status"]
+        if "FREE" in st:
+            badge = f"{BOLD}{GREEN}[ FREE ]{RESET}"
+            sym = f"{GREEN}●{RESET}"
+        elif "CONFLICT" in st:
+            badge = f"{BOLD}{BG_RED}{WHITE}[ SPLIT COLLISION ]{RESET}"
+            sym = f"{RED}▲{RESET}"
+        elif "HELD" in st:
+            dur_str = format_duration(b["duration_s"]) if b["duration_s"] > 0 else ""
+            dur_tag = f" {dur_str}" if dur_str else ""
+            if b.get("idle_s", 0) > 0:
+                dur_tag += " · idle"
+            badge = f"{BOLD}{RED}[ HELD{dur_tag} ]{RESET}"
+            sym = f"{RED}●{RESET}"
+        elif "PARKED" in st:
+            badge = f"{BOLD}{YELLOW}[ PARKED ]{RESET}"
+            sym = f"{YELLOW}●{RESET}"
+        elif "STALE" in st:
+            badge = f"{BOLD}{BG_RED}{WHITE}[ STALE ]{RESET}"
+            sym = f"{RED}●{RESET}"
+        elif "FLAGGED" in st:
+            badge = f"{BOLD}{MAGENTA}[ FLAGGED ]{RESET}"
+            sym = f"{MAGENTA}●{RESET}"
+        else:
+            badge = f"[{st}]"
+            sym = "●"
+
+        display_name = b["label"]
+        if display_name != b["resource"]:
+            name_part = f"{sym} {BOLD}{WHITE}{display_name}{RESET} {DIM}({b['resource']}){RESET}"
+        else:
+            name_part = f"{sym} {BOLD}{WHITE}{display_name}{RESET}"
+
+        v_name = visible_len(name_part)
+        v_badge = visible_len(badge)
+        spaces = max(1, width - v_name - v_badge)
+        lines.append(f"{name_part}{' ' * spaces}{badge}")
+
+        if b["port"]:
+            port_name = b["port"].replace("/dev/cu.", "")
+            sn_tag = f" {DIM}({b['serial'][-8:]}){RESET}" if b.get("serial") else ""
+            lines.append(f"  {DIM}{'Port:':<7}{RESET} {port_name}{sn_tag}")
+
+        if b.get("is_split"):
+            lines.append(f"  {BG_RED}{WHITE}CRITICAL:{RESET} {RED}Duplicate lock under '{b['lock_key']}' while '{b['resource']}' is also locked!{RESET}")
+        elif b.get("is_alias"):
+            lines.append(f"  {YELLOW}▲ Legacy lock name: {b['lock_key']}{RESET}")
+
+        if b["pid"]:
+            lines.append(f"  {DIM}{'Holder:':<7}{RESET} {b['user']} {DIM}(PID {b['pid']}){RESET}")
+        elif b["user"] and "FREE" not in st:
+            lines.append(f"  {DIM}{'Holder:':<7}{RESET} {b['user']}")
+
+        proc = b.get("proc")
+        if proc and isinstance(proc, dict) and proc.get("args"):
+            agent_str = proc.get("label", proc.get("exe", ""))
+            lines.append(f"  {DIM}{'Agent:':<7}{RESET} {BOLD}{agent_str}{RESET}")
+            if proc.get("cwd"):
+                c_path = shorten_path(proc["cwd"], max(15, width - 12))
+                lines.append(f"  {DIM}{'Path:':<7}{RESET} {c_path}")
+            if proc.get("child"):
+                lines.extend(make_labeled_line("Active:", proc["child"], width, text_style=CYAN))
+
+        if b.get("port_open"):
+            for p_pid, p_usr, p_cmd in b["port_open"]:
+                is_holder_tool = is_descendant_of(p_pid, b.get("pid"))
+                if is_holder_tool:
+                    lines.extend(make_labeled_line("Serial:", f"open by PID {p_pid} ({p_cmd}) [holder task]", width, text_style=GREEN))
+                else:
+                    lines.extend(make_labeled_line("Serial:", f"open by PID {p_pid} ({p_cmd}, {p_usr}) CONFLICT!", width, text_style=BOLD + RED))
+
+        if b.get("note") and b["note"].strip() and "FLAGGED" not in st:
+            lines.extend(make_labeled_line("Why:", b["note"].strip(), width, text_style=ITALIC))
+
+        if b.get("parked"):
+            p_reason = b["parked"]["reason"].strip()
+            lines.extend(make_labeled_line("Parked:", p_reason, width, text_style=YELLOW))
+
+        if b.get("flag"):
+            f_reason = b["flag"].get("reason", "").strip()
+            if len(f_reason) > 130 and "FLAGGED" in st:
+                f_reason = f_reason[:127].rsplit(" ", 1)[0] + "..."
+            lines.extend(make_labeled_line("Flag:", f_reason, width, text_style=MAGENTA))
+
+        lines.append("")
+
+    if unregistered:
+        sep_title = f"{BOLD}{YELLOW}── Other Active Locks ──{RESET}"
+        lines.append(sep_title + ("─" * max(0, width - visible_len(sep_title))))
+        for ol in unregistered:
+            st = ol["status"]
+            if "HELD" in st:
+                badge = f"{BOLD}{RED}[ HELD ]{RESET}"
+                sym = f"{RED}●{RESET}"
+            elif "PARKED" in st:
+                badge = f"{BOLD}{YELLOW}[ PARKED ]{RESET}"
+                sym = f"{YELLOW}●{RESET}"
+            elif "FLAGGED" in st:
+                badge = f"{BOLD}{MAGENTA}[ FLAGGED ]{RESET}"
+                sym = f"{MAGENTA}●{RESET}"
+            else:
+                badge = f"[{st}]"
+                sym = "●"
+
+            name_part = f"{sym} {WHITE}{ol['resource']}{RESET}"
+            spaces = max(1, width - visible_len(name_part) - visible_len(badge))
+            lines.append(f"{name_part}{' ' * spaces}{badge}")
+            if ol["user"]:
+                lines.append(f"  {DIM}{'By:':<7}{RESET} {ol['user']}")
+            if ol["duration_s"] > 0:
+                lines.append(f"  {DIM}{'For:':<7}{RESET} {format_duration(ol['duration_s'])}")
+            if ol["note"]:
+                note_raw = ol["note"].strip()
+                if len(note_raw) > 130:
+                    note_raw = note_raw[:127].rsplit(" ", 1)[0] + "..."
+                lines.extend(make_labeled_line("Why:", note_raw, width, text_style=DIM))
+            lines.append("")
+
+    lines.append("─" * width)
+    lines.append(f"{DIM}Updating every {interval}s · Ctrl+C to quit{RESET}")
+    return "\n".join(lines)
+
+
+def render_wide(items, unregistered, lock_dir: str, interval: int, count: int, width: int, query: str = "", error_msg: str = None) -> str:
+    """Render tabular layout for wide terminals (>= 80 columns) with strict line-width bounds."""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    lines = []
+    filter_tag = f" {CYAN}[filter: {query}]{RESET}" if query else ""
+    hdr_title = f"{BOLD}{CYAN}═══ RESOURCE LOCK MONITOR ═══{RESET}{filter_tag}  {DIM}[{now_str}]{RESET}"
+    lines.append(hdr_title)
+
+    if error_msg:
+        lines.append(f"{BOLD}{RED}{error_msg}{RESET}")
+        lines.append("─" * width)
+        return "\n".join(lines)
+
+    all_items = items + unregistered
+    num_held = sum(1 for b in all_items if any(s in b["status"] for s in ("HELD", "PARKED", "STALE", "CONFLICT")))
+    num_free = sum(1 for b in all_items if "FREE" in b["status"])
+
+    # Format subtitle cleanly fitting within width
+    sub_full = f"{DIM}Store: {lock_dir}  │  Locks: {BOLD}{GREEN}{num_free} FREE{RESET}{DIM}, {BOLD}{RED if num_held else GREEN}{num_held} HELD{RESET}{DIM}  │  every {interval}s (cycle #{count}){RESET}"
+    if visible_len(sub_full) > width:
+        sub_full = f"{BOLD}{GREEN}{num_free} FREE{RESET}{DIM} · {BOLD}{RED if num_held else GREEN}{num_held} HELD{RESET}{DIM} · every {interval}s (cycle #{count}){RESET}"
+    if visible_len(sub_full) > width:
+        sub_full = f"{BOLD}{GREEN}{num_free} FREE{RESET}{DIM} · {BOLD}{RED if num_held else GREEN}{num_held} HELD{RESET}"
+    lines.append(sub_full)
+    lines.append("─" * width)
+
+    # Strictly bounded column allocation guaranteeing sum(cols) + separators <= width
+    c_status = 9
+    c_dur = 11
+    # 5 separators of 1 space = 5
+    avail = max(30, width - (c_status + c_dur + 5))
+    c_name = max(10, min(16, int(avail * 0.22)))
+    c_port = max(12, min(18, int(avail * 0.25)))
+    c_holder = max(12, min(18, int(avail * 0.25)))
+    c_why = max(10, avail - (c_name + c_port + c_holder))
+
+    hdr = (
+        f"{BOLD}{'RESOURCE':<{c_name}} {'STATUS':<{c_status}} "
+        f"{'PORT / DEVICE':<{c_port}} {'HOLDER':<{c_holder}} "
+        f"{'DURATION':<{c_dur}} {'WHY / NOTE':<{c_why}}{RESET}"
+    )
+    lines.append(hdr[:width + 100])  # ensure header line length is safe
+    lines.append("─" * width)
+
+    if not all_items:
+        lines.append(f"{DIM}No matching resources or active locks found.{RESET}")
+
+    for b in items:
+        status = b["status"]
+        if "FREE" in status:
+            status_col = f"{BOLD}{GREEN}FREE{RESET}    "
+        elif "CONFLICT" in status:
+            status_col = f"{BOLD}{BG_RED}{WHITE}CONFLICT{RESET} "
+        elif "HELD" in status:
+            status_col = f"{BOLD}{RED}HELD{RESET}    "
+        elif "PARKED" in status:
+            status_col = f"{BOLD}{YELLOW}PARKED{RESET}  "
+        elif "STALE" in status:
+            status_col = f"{BOLD}{BG_RED}{WHITE}STALE{RESET}   "
+        elif "FLAGGED" in status:
+            status_col = f"{BOLD}{MAGENTA}FLAGGED{RESET} "
+        else:
+            status_col = f"{status:<9}"
+
+        disp_name = b["label"]
+        if len(disp_name) > c_name:
+            disp_name = disp_name[:c_name - 1] + "…"
+        b_name = f"{BOLD}{WHITE}{disp_name:<{c_name}}{RESET}"
+
+        if b["port"]:
+            port_short = b["port"].replace("/dev/cu.", "")
+            sn_s = f" {DIM}{b['serial'][-4:]}{RESET}" if b.get("serial") else ""
+            port_str = f"{port_short}{sn_s}"
+        else:
+            port_str = f"{DIM}—{RESET}"
+        pad_port = max(0, c_port - visible_len(port_str))
+        port_col = f"{port_str[:c_port]}{' ' * pad_port}"
+
+        if b["pid"]:
+            holder_text = f"{b['user']} ({b['pid']})"
+        elif b["user"] and "FREE" not in status:
+            holder_text = b["user"]
+        else:
+            holder_text = f"{DIM}—{RESET}"
+        pad_holder = max(0, c_holder - visible_len(holder_text))
+        holder_col = f"{holder_text[:c_holder]}{' ' * pad_holder}"
+
+        if b["duration_s"] > 0:
+            dur_str = format_duration(b["duration_s"])
+            if b.get("idle_s", 0) > 0:
+                dur_str += f" {YELLOW}[idle]{RESET}"
+        else:
+            dur_str = f"{DIM}—{RESET}"
+        pad_dur = max(0, c_dur - visible_len(dur_str))
+        dur_col = f"{dur_str[:c_dur]}{' ' * pad_dur}"
+
+        note_str = b.get("note", "").replace("\n", " ").strip()
+        is_note_truncated = len(note_str) > c_why
+        first_note = note_str[:c_why - 3] + "..." if is_note_truncated else note_str
+        if not first_note:
+            first_note = f"{DIM}—{RESET}"
+        pad_why = max(0, c_why - visible_len(first_note))
+        why_col = f"{first_note[:c_why]}{' ' * pad_why}"
+
+        row = f"{b_name} {status_col} {port_col} {holder_col} {dur_col} {why_col}"
+        lines.append(row)
+
+        if b.get("is_split"):
+            lines.append(f"   {BG_RED}{WHITE}CRITICAL:{RESET} {RED}Duplicate lock under '{b['lock_key']}' while '{b['resource']}' is also locked!{RESET}")
+        elif b.get("is_alias"):
+            lines.append(f"   {YELLOW}▲ Held under legacy alias '{b['lock_key']}' instead of canonical '{b['resource']}'!{RESET}")
+
+        if is_note_truncated and note_str and "FLAGGED" not in status:
+            lines.extend(make_labeled_line("Why:", note_str, width - 2, text_style=ITALIC))
+
+        proc = b.get("proc")
+        if proc and isinstance(proc, dict) and proc.get("args"):
+            proc_label = proc.get("label", proc.get("exe", ""))
+            agent_details = []
+            if proc.get("cwd"):
+                agent_details.append(f"in {shorten_path(proc.get('cwd', ''), 25)}")
+            if proc.get("child"):
+                agent_details.append(f"active: {proc.get('child')}")
+            agent_str = f"{proc_label} ({', '.join(agent_details)})" if agent_details else proc_label
+            lines.extend(make_labeled_line("Agent:", agent_str, width - 2, text_style=BOLD))
+
+        if b.get("port_open"):
+            for p_pid, p_usr, p_cmd in b["port_open"]:
+                is_holder_tool = is_descendant_of(p_pid, b.get("pid"))
+                if is_holder_tool:
+                    lines.extend(make_labeled_line("Serial:", f"open by PID {p_pid} ({p_cmd}) [holder task]", width - 2, text_style=GREEN))
+                else:
+                    lines.extend(make_labeled_line("Serial:", f"open by PID {p_pid} ({p_cmd}, {p_usr}) CONFLICT!", width - 2, text_style=BOLD + RED))
+
+        if b.get("parked"):
+            lines.extend(make_labeled_line("Parked:", b["parked"]["reason"].strip(), width - 2, text_style=YELLOW))
+
+        if b.get("flag"):
+            lines.extend(make_labeled_line("Flag:", b["flag"].get("reason", "").strip(), width - 2, text_style=MAGENTA))
+
+    if unregistered:
+        lines.append("")
+        lines.append(f"{BOLD}{YELLOW}── Other Active Locks & Flags ──────────────────────────────────────────────────{RESET}"[:width])
+        hdr2 = f"{BOLD}{'RESOURCE':<18} {'STATUS':<9} {'HOLDER':<18} {'DURATION':<11} {'WHY / NOTE'}{RESET}"
+        lines.append(hdr2)
+        for ol in unregistered:
+            st = ol["status"]
+            if "HELD" in st:
+                st_col = f"{BOLD}{RED}HELD{RESET}    "
+            elif "PARKED" in st:
+                st_col = f"{BOLD}{YELLOW}PARKED{RESET}  "
+            elif "STALE" in st:
+                st_col = f"{BOLD}{BG_RED}{WHITE}STALE{RESET}   "
+            elif "FLAGGED" in st:
+                st_col = f"{BOLD}{MAGENTA}FLAGGED{RESET} "
+            else:
+                st_col = f"{st:<9}"
+
+            r_name = f"{WHITE}{ol['resource']:<18}{RESET}"
+            h_str = f"{ol['user']} (pid {ol['pid']})" if ol["pid"] else (ol["user"] or f"{DIM}—{RESET}")
+            pad_h = max(0, 18 - visible_len(h_str))
+            h_col = f"{h_str}{' ' * pad_h}"
+            d_str = format_duration(ol["duration_s"]) if ol["duration_s"] > 0 else f"{DIM}—{RESET}"
+            pad_d = max(0, 11 - visible_len(d_str))
+            d_col = f"{d_str}{' ' * pad_d}"
+            note_w = max(15, width - 60)
+            first_note = ol["note"].replace("\n", " ").strip()
+            if len(first_note) > note_w:
+                first_note = first_note[:note_w - 3] + "..."
+            lines.append(f"{r_name} {st_col} {h_col} {d_col} {first_note}")
+
+    lines.append("─" * width)
+    lines.append(f"{DIM}Updating every {interval}s · Ctrl+C to quit{RESET}")
+    return "\n".join(lines)
+
+
+def render_dashboard(items, unregistered, lock_dir: str, interval: int, count: int, mode: str = "auto", query: str = "", error_msg: str = None) -> str:
+    """Select layout mode responsively based on terminal width."""
+    width = get_terminal_width()
+    if mode == "compact" or (mode == "auto" and width < 80):
+        return render_compact(items, unregistered, lock_dir, interval, count, width, query, error_msg)
+    else:
+        return render_wide(items, unregistered, lock_dir, interval, count, width, query, error_msg)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Live monitor for agent resource locks.")
+    parser.add_argument(
+        "query",
+        nargs="?",
+        default="",
+        help="Optional filter query (e.g. 'esp32', 'rig', 'scope')",
+    )
+    parser.add_argument(
+        "-i", "--interval",
+        type=int,
+        default=5,
+        help="Update interval in seconds (default: 5)",
+    )
+    parser.add_argument(
+        "-1", "--once",
+        action="store_true",
+        help="Print current status once and exit (no loop)",
+    )
+    parser.add_argument(
+        "-a", "--all",
+        action="store_true",
+        help="Show all registered resources from aliases.conf, including idle/free",
+    )
+    parser.add_argument(
+        "-c", "--compact",
+        action="store_true",
+        help="Force compact card layout regardless of terminal width",
+    )
+    parser.add_argument(
+        "-w", "--wide",
+        action="store_true",
+        help="Force wide tabular layout regardless of terminal width",
+    )
+    parser.add_argument(
+        "--dir",
+        default=os.environ.get("AGENT_LOCK_DIR", "/tmp/claude-locks"),
+        help="Lock directory (default: /tmp/claude-locks or $AGENT_LOCK_DIR)",
+    )
+    parser.add_argument(
+        "--aliases",
+        default=os.environ.get("AGENT_LOCK_ALIASES", os.path.join(os.path.dirname(os.path.abspath(__file__)), "aliases.conf")),
+        help="Aliases configuration file (default: aliases.conf in script dir)",
+    )
+    args = parser.parse_args()
+
+    lock_dir = args.dir
+    aliases_path = args.aliases
+    interval = max(1, args.interval)
+
+    layout_mode = "auto"
+    if args.compact:
+        layout_mode = "compact"
+    elif args.wide:
+        layout_mode = "wide"
+
+    def handle_sigint(sig, frame):
+        sys.stdout.write("\033[?25h\n")
+        sys.stdout.flush()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handle_sigint)
+    signal.signal(signal.SIGTERM, handle_sigint)
+
+    count = 1
+    if args.once:
+        items, unregistered, err = collect_data(lock_dir, aliases_path, show_all=args.all, query=args.query)
+        output = render_dashboard(items, unregistered, lock_dir, interval, count, layout_mode, args.query, err)
+        print(output)
+        return
+
+    sys.stdout.write("\033[?25l")
+    try:
+        while True:
+            items, unregistered, err = collect_data(lock_dir, aliases_path, show_all=args.all, query=args.query)
+            output = render_dashboard(items, unregistered, lock_dir, interval, count, layout_mode, args.query, err)
+            sys.stdout.write("\033[H\033[J" + output + "\n")
+            sys.stdout.flush()
+            count += 1
+            time.sleep(interval)
+    finally:
+        sys.stdout.write("\033[?25h\n")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
