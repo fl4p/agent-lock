@@ -19,6 +19,7 @@ L=~/.claude/skills/lock/lock.sh
 "$L" release <name> [--force]  # give it back; --force breaks another session's lock
 "$L" status  <name>            # FREE or HELD (+ holder info)
 "$L" list                      # all locks, [held] / [stale] / [FLAGGED]
+"$L" top [filter] [-i S]       # live responsive monitor (compact cards <80 cols, table >=80 cols; -1 for once)
 "$L" note   <name> "text"      # correct the note on a lock you hold
 "$L" run    <name> "note" [--timeout S] -- <cmd...>   # acquire, run, ALWAYS release
 "$L" park   <name> "reason"    # done with it but can't release: others may take it
@@ -26,6 +27,10 @@ L=~/.claude/skills/lock/lock.sh
 "$L" flag   <name> "reason"    # raise a warning that OUTLIVES the lock
 "$L" unflag <name>             # clear it
 "$L" resolve <name>            # what canonical lock does this name mean?
+"$L" mine   <name> [--quiet]   # exit 0 ONLY if WE hold it (status says HELD for a peer too)
+"$L" want   <name> ["who"]     # ask the holder to hand it over, without taking it
+"$L" wanted <name>             # exit 0 if somebody asked; for a holder's poll loop
+"$L" unwant <name>             # withdraw the request
 ```
 
 Exit codes: `0` = ok/free, `1` = busy/held/flagged, `2` = error.
@@ -156,3 +161,42 @@ hours past the end of the work, with two peer sessions blocked on the same rig.
 Before assuming a held lock belongs to someone else, check:
 `ps -p <pid> -o command=` — if it is a `claude --resume <your-own-session-id>`,
 it is yours.
+
+
+### `status` says HELD for a peer's lock too — long-running jobs must ask `mine`
+
+`status` answers *is this locked*, not *is it mine*. A loop that branches on `HELD` keeps
+running when a peer takes the board, which is the worst possible reading: it is exactly the
+case where you must stop. On 2026-09-15 a yield-mode daemon did this — it also checked
+`acquire`'s **output** instead of its exit status, and on refusal `acquire` prints the current
+holder's note, which reads like success — and it flashed `esp32s3-1588` out from under
+another session's BLE measurement, destroying their image and ~2.5 minutes of their data.
+
+```bash
+while :; do
+  "$L" mine "$LOCK" --quiet || { stop_touching_the_device; break; }   # every cycle
+  "$L" wanted "$LOCK" >/dev/null && { hand_it_over; break; }
+  ...
+done
+```
+
+Two rules fall out, and they cost one line each:
+
+- **Branch on `mine`, never on `status`,** in anything that outlives a single command.
+- **Branch on an exit status, never on output.** A refusal that prints the holder's note is
+  indistinguishable from success if you only read the text.
+
+### Yield mode: `want` / `wanted`, because `wait` registers nothing
+
+`wait` is a polling loop. It leaves no trace, so a holder part-way through a long run has no
+way to learn that anybody is queued behind it, and every cooperative holder ends up inventing
+its own file convention. `want` records the request where everyone already looks:
+
+```bash
+"$L" want esp32s3-1588 "need the bench for a BLE run"   # asks; does NOT take the lock
+```
+
+A holder running in yield mode polls `wanted` and releases. `release` clears the request, so
+one hand-over is not served twice. Say so in your note, so a peer knows asking will work:
+
+    YIELD MODE — yours on request: `lock.sh want <name>` and I release within ~10 s.

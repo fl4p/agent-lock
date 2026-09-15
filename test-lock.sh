@@ -385,6 +385,49 @@ case "$out" in *SHOULD_NOT_RUN*) bad "the command must NOT run without the lock"
 out=$("$L" status scope 2>&1); rc=$?
 check "the peer still holds it afterwards" 1 "$rc" "$out"
 
+echo "== 26. top: live monitor executes cleanly in one-shot mode =="
+out=$("$L" top --once 2>&1); rc=$?
+check "top --once succeeds" 0 "$rc" "$out"
+has   "  ...and displays the held resource" "scope" "$out"
+has   "  ...and displays the holder note" "peer is using it" "$out"
+out=$("$L" top --once --compact 2>&1); rc=$?
+check "top --once --compact succeeds" 0 "$rc" "$out"
+has   "  ...and displays the held resource in compact mode" "scope" "$out"
+
 echo
+echo "== 27. mine: HELD is not the question, held BY US is =="
+# The 2026-09-15 known-bad. A yield-mode daemon branched on `status` saying HELD -- which is
+# equally true when a PEER holds it -- and flashed esp32s3-1588 out from under another
+# session's BLE measurement. `mine` must answer with an exit status, and must say NO here.
+rm -rf "$AGENT_LOCK_DIR"/scope.lock
+seed_held_by_other scope "a live peer session"
+out=$("$L" mine scope 2>&1); rc=$?
+check "mine REFUSES a lock held by a peer" 1 "$rc" "$out"
+out=$("$L" status scope 2>&1)
+case "$out" in HELD*) ok "  ...while status still says HELD, which is the trap" ;;
+               *) bad "  ...status no longer says HELD" "$out" ;; esac
+rm -rf "$AGENT_LOCK_DIR"/scope.lock
+out=$("$L" mine scope 2>&1); rc=$?
+check "mine REFUSES a lock nobody holds" 1 "$rc" "$out"
+"$L" acquire scope "ours" >/dev/null 2>&1
+out=$("$L" mine scope 2>&1); rc=$?
+check "mine ACCEPTS a lock we actually hold" 0 "$rc" "$out"
+out=$("$L" mine scope --quiet 2>&1); rc=$?
+check "mine --quiet stays silent and still answers 0" 0 "$rc" "$out"
+[ -z "$out" ] && ok "  ...and printed nothing" || bad "  ...--quiet printed something" "$out"
+
+echo "== 28. want/wanted: asking for a board without taking it =="
+out=$("$L" wanted scope 2>&1); rc=$?
+check "wanted is 1 when nobody asked" 1 "$rc" "$out"
+"$L" want scope "another session needs the bench" >/dev/null 2>&1
+out=$("$L" wanted scope 2>&1); rc=$?
+check "wanted is 0 once somebody asked" 0 "$rc" "$out"
+case "$out" in *"needs the bench"*) ok "  ...and carries the requester's note" ;;
+               *) bad "  ...lost the note" "$out" ;; esac
+[ -d "$AGENT_LOCK_DIR/scope.lock" ] && ok "want did NOT take the lock" || bad "want took the lock"
+"$L" release scope >/dev/null 2>&1
+out=$("$L" wanted scope 2>&1); rc=$?
+check "release clears the request, so the handover is not served twice" 1 "$rc" "$out"
+
 echo "passed $pass, failed $fail"
 [ "$fail" = 0 ] || exit 1

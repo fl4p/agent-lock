@@ -12,6 +12,7 @@ cmd=${1:-}; name=${2:-}
 sanitize() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad resource name: $1" >&2; exit 2; }; }
 lockpath() { echo "$DIR/$1.lock"; }
 flagpath() { echo "$DIR/$1.flag"; }
+wantpath() { echo "$DIR/$1.want"; }
 
 # --- resource identity -------------------------------------------------------------
 # One instrument, one lock. An unregistered name is refused rather than granted: a typo
@@ -479,6 +480,38 @@ case "$cmd" in
     sanitize "$name"; canon_or_literal "$name"; canon=$CANON; fp=$(flagpath "$canon")
     [ -e "$fp" ] || { echo "not flagged: $canon"; exit 0; }
     rm -f "$fp" && echo "UNFLAGGED $canon" || exit 2 ;;
+  mine)
+    # "Do I hold this?" as an EXIT STATUS. `status` says HELD, which is equally true when a
+    # PEER holds it -- a daemon that branched on HELD flashed a board out from under another
+    # session's measurement on 2026-09-15. Anything long-running must ask THIS instead, every
+    # cycle, and stop touching the device the moment it answers no.
+    #   0 = ours, 1 = not ours (free, or someone else's), 2 = bad name
+    sanitize "$name"; canon_or_literal "$name"; canon=$CANON; lp=$(lockpath "$canon")
+    me=$(owner_pid); hp=$(holder_pid "$lp" 2>/dev/null)
+    if [ -d "$lp" ] && [ -n "$hp" ] && [ "$hp" = "$me" ] && [ "$me" != unknown ]; then
+      [ "${3:-}" = --quiet ] || echo "MINE $canon (pid $me)"; exit 0
+    fi
+    [ "${3:-}" = --quiet ] || {
+      if [ -d "$lp" ]; then echo "NOT MINE $canon (held by pid ${hp:-?}, we are $me)"
+      else echo "NOT MINE $canon (not locked)"; fi; }
+    exit 1 ;;
+  want|unwant|wanted)
+    # The missing primitive: a way to ASK for a board without taking it. `wait` is a polling
+    # loop that registers nothing, so a holder running a long job has no way to learn that
+    # anyone is queued behind it, and every cooperative holder ends up inventing its own
+    # file convention. This is that convention, in the one place everybody already looks.
+    #   want <name> [who]   register interest        (a holder in yield mode releases)
+    #   wanted <name>       0 if somebody asked      (for the holder's poll loop)
+    #   unwant <name>       withdraw / clear it
+    sanitize "$name"; canon_or_literal "$name"; canon=$CANON; wp=$(wantpath "$canon")
+    case "$1" in
+      want)   printf 'who=%s\nsince=%s\nnote=%s\n' "$(owner_pid)" "$(date '+%F %T')" "$(clean_note "${3:-}")" > "$wp" || exit 2
+              echo "WANTED $canon — the holder releases it if it is running in yield mode; otherwise ask."
+              [ -d "$(lockpath "$canon")" ] && show "$(lockpath "$canon")"
+              exit 0 ;;
+      wanted) [ -e "$wp" ] || exit 1; [ "${3:-}" = --quiet ] || sed 's/^/  /' "$wp"; exit 0 ;;
+      unwant) rm -f "$wp" || exit 2; echo "cleared any request for $canon"; exit 0 ;;
+    esac ;;
   release)
     sanitize "$name"; canon_or_literal "$name"; canon=$CANON; lp=$(lockpath "$canon")
     [ -d "$lp" ] || { echo "not locked: $canon"; exit 0; }
@@ -488,6 +521,7 @@ case "$cmd" in
       show "$lp" >&2; exit 1
     fi
     rm -rf "$lp" || exit 2
+    rm -f "$(wantpath "$canon")"      # the hand-over happened; the request is served
     if [ -e "$(flagpath "$canon")" ]; then
       echo "RELEASED $canon — NOTE: it is still FLAGGED:"
       sed 's/^/  /' "$(flagpath "$canon")" 2>/dev/null
@@ -533,6 +567,9 @@ case "$cmd" in
       echo "$(basename "$fp" .flag) [FLAGGED]: $(tr '\n' ' ' < "$fp" 2>/dev/null)"
     done
     [ "$found" = 0 ] && echo "no locks held"; exit 0 ;;
+  top|monitor|watch)
+    shift || true
+    exec "$HERE/lock-top" "$@" ;;
   resolve)
     sanitize "$name"
     resolve "$name"; rrc=$?
@@ -541,6 +578,6 @@ case "$cmd" in
   *)
     echo "usage: lock.sh acquire <name> [note] [--new] [--ack] [--brief] | release <name> [--force]" >&2
     echo "       lock.sh note <name> \"text\" [--force] | flag <name> \"reason\" | unflag <name>" >&2
-    echo "       lock.sh status <name> | list | resolve <name> | wait <name> [note] [timeout]\n       lock.sh park <name> \"reason\" | unpark <name>\n       lock.sh run <name> \"note\" [--timeout S] -- <command...>   # acquire, run, ALWAYS release" >&2
+    echo "       lock.sh status <name> | list | top [filter] | resolve <name> | wait <name> [note] [timeout]\n       lock.sh park <name> \"reason\" | unpark <name>\n       lock.sh mine <name> [--quiet]                              # exit 0 only if WE hold it\n       lock.sh want <name> [who] | wanted <name> | unwant <name>  # ask a holder to hand it over\n       lock.sh run <name> \"note\" [--timeout S] -- <command...>   # acquire, run, ALWAYS release" >&2
     exit 2 ;;
 esac
