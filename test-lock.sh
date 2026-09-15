@@ -394,6 +394,14 @@ out=$("$L" top --once --compact 2>&1); rc=$?
 check "top --once --compact succeeds" 0 "$rc" "$out"
 has   "  ...and displays the held resource in compact mode" "scope" "$out"
 
+# session reporting: acquire with --session records session and top displays it
+fresh
+"$L" acquire scope "testing session" --session "sess-alpha" >/dev/null 2>&1
+has   "acquire --session writes session to info" "session=sess-alpha" "$(cat "$AGENT_LOCK_DIR/scope.lock/info")"
+out=$("$L" top --once --compact 2>&1)
+has   "top displays session in holder" "sess-alpha" "$out"
+"$L" release scope >/dev/null 2>&1
+
 echo
 echo "== 27. mine: HELD is not the question, held BY US is =="
 # The 2026-09-15 known-bad. A yield-mode daemon branched on `status` saying HELD -- which is

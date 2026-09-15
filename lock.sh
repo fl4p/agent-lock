@@ -148,6 +148,50 @@ owner_pid() { # walk ancestry to the long-lived agent process; "unknown" if none
   echo unknown  # fail closed: never auto-stolen, --force only
 }
 
+owner_agent() { # identify agent binary/name from owner pid
+  local pid=${1:-unknown}
+  [ "$pid" = unknown ] || [ -z "$pid" ] && { echo "${AI_AGENT:-unknown}"; return; }
+  local comm
+  comm=$(basename "$(ps -o comm= -p "$pid" 2>/dev/null)")
+  case "$comm" in
+    claude) echo "claude" ;;
+    codex|codex-*) echo "codex" ;;
+    pi) echo "pi" ;;
+    opencode) echo "opencode" ;;
+    node|bun)
+      local args
+      args=$(ps -p "$pid" -o args= 2>/dev/null)
+      case "$args" in
+        *claude*) echo "claude" ;;
+        *codex*) echo "codex" ;;
+        *pi*) echo "pi" ;;
+        *) echo "${comm:-unknown}" ;;
+      esac
+      ;;
+    *) echo "${AI_AGENT:-${comm:-unknown}}" ;;
+  esac
+}
+
+owner_session() { # $1 = explicit session, $2 = owner pid
+  if [ -n "${1:-}" ]; then echo "$1"; return; fi
+  if [ -n "${AGENT_SESSION_NAME:-}" ]; then echo "$AGENT_SESSION_NAME"; return; fi
+  if [ -n "${SESSION_NAME:-}" ]; then echo "$SESSION_NAME"; return; fi
+  if [ -n "${PI_SESSION_ID:-}" ]; then echo "${PI_SESSION_ID:0:8}"; return; fi
+  if [ -n "${CODEX_SESSION_ID:-}" ]; then echo "${CODEX_SESSION_ID:0:8}"; return; fi
+  if [ -n "${PASEO_AGENT_ID:-}" ]; then echo "${PASEO_AGENT_ID:0:8}"; return; fi
+  local pid=${2:-unknown}
+  if [ "$pid" != unknown ] && [ -n "$pid" ]; then
+    local args
+    args=$(ps -p "$pid" -o args= 2>/dev/null)
+    local s
+    s=$(echo "$args" | sed -n 's/.*--resume[= ]\([a-zA-Z0-9_-]\{8\}\).*/\1/p' | head -1)
+    [ -n "$s" ] && { echo "$s"; return; }
+    s=$(echo "$args" | sed -n 's/.*--session-id[= ]\([a-zA-Z0-9_-]\{8\}\).*/\1/p' | head -1)
+    [ -n "$s" ] && { echo "$s"; return; }
+  fi
+  echo ""
+}
+
 holder_pid() { sed -n 's/^pid=//p' "$1/info" 2>/dev/null; }
 
 holder_dead() { # true ONLY if the holder pid is provably dead (anything else => alive)
@@ -297,14 +341,19 @@ case "$cmd" in
     # The note is STRICTLY positional ($3). Flags are recognised only from $4 on, because
     # scanning every argument made the note itself an option channel: `acquire rig "--ack"`
     # is a correctly-quoted call that used to silently override a burning-smell flag.
-    note=$(clean_note "${3:-}"); want_new=no; ack=no
-    for a in "${@:4}"; do
-      case "$a" in
+    note=$(clean_note "${3:-}"); want_new=no; ack=no; opt_session=""
+    shift 3 2>/dev/null || shift $#
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
         --new) want_new=yes ;;
         --ack) ack=yes ;;
         --brief) BRIEF=yes ;;
-        *)     echo "unknown option: $a (the note is the 3rd argument)" >&2; exit 2 ;;
+        --session) shift || { echo "missing argument for --session" >&2; exit 2; }
+                   opt_session=$(clean_note "${1:-}") ;;
+        --session=*) opt_session=$(clean_note "${1#*=}") ;;
+        *)     echo "unknown option: $1 (the note is the 3rd argument)" >&2; exit 2 ;;
       esac
+      shift
     done
     resolve "$name"; rrc=$?
     if [ "$rrc" = 0 ]; then canon=$CANON
@@ -324,10 +373,12 @@ case "$cmd" in
     done < <(aliases_of "$canon")
     check_flag "$canon" "$([ "$ack" = yes ] && echo ack || echo noack)"
     lp=$(lockpath "$canon"); me=$(owner_pid)
+    agent=$(owner_agent "$me")
+    sess=$(owner_session "$opt_session" "$me")
     for i in 1 2; do
       if mkdir "$lp" 2>/dev/null; then
-        if ! printf 'resource=%s\npid=%s\nuser=%s\nsince=%s\nnote=%s\n' \
-             "$canon" "$me" "$USER" "$(date '+%Y-%m-%d %H:%M:%S')" "$note" > "$lp/info"; then
+        if ! printf 'resource=%s\npid=%s\nuser=%s\nagent=%s\nsession=%s\nsince=%s\nnote=%s\n' \
+             "$canon" "$me" "$USER" "$agent" "$sess" "$(date '+%Y-%m-%d %H:%M:%S')" "$note" > "$lp/info"; then
           rm -rf "$lp"   # never leave an ownerless lock behind and report success
           echo "cannot write lock info under $DIR" >&2; exit 2
         fi
@@ -377,9 +428,20 @@ case "$cmd" in
     # blocking acquire: retry until acquired or timeout. Run it in the background
     # (run_in_background / dtach) so the agent is woken when the lock lands.
     sanitize "$name"
-    timeout=${4:-3600}; deadline=$(( $(date +%s) + timeout ))
+    wait_note=${3:-}; timeout=${4:-3600}; deadline=$(( $(date +%s) + timeout ))
+    wait_session=""
+    shift 4 2>/dev/null || shift $#
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --session) shift || true; wait_session=$(clean_note "${1:-}") ;;
+        --session=*) wait_session=$(clean_note "${1#*=}") ;;
+      esac
+      shift || true
+    done
+    acq_cmd=("$0" acquire "$name" "$wait_note")
+    [ -n "$wait_session" ] && acq_cmd+=("--session" "$wait_session")
     while :; do
-      out=$("$0" acquire "$name" "${3:-}" 2>/dev/null); rc=$?
+      out=$("${acq_cmd[@]}" 2>/dev/null); rc=$?
       [ "$rc" = 0 ] && { echo "$out"; exit 0; }
       # 2 is an error (bad name, unreadable registry) and 1-with-a-flag will never clear
       # on its own — neither is worth retrying for an hour.
@@ -402,16 +464,26 @@ case "$cmd" in
     # the hardware anyway. Measured 2026-09-14.
     sanitize "$name"
     shift 2 || true
-    runnote=""; runto=3600
-    if [ "${1:-}" != "--" ] && [ "${1:-}" != "--timeout" ]; then runnote=$(clean_note "${1:-}"); shift || true; fi
-    if [ "${1:-}" = "--timeout" ]; then runto=${2:-3600}; shift 2 || true; fi
-    [ "${1:-}" = "--" ] || { echo "usage: lock.sh run <name> \"note\" [--timeout S] -- <command...>" >&2; exit 2; }
+    runnote=""; runto=3600; runsess=""
+    while [ "$#" -gt 0 ] && [ "${1:-}" != "--" ]; do
+      case "$1" in
+        --timeout) shift || true; runto=${1:-3600} ;;
+        --session) shift || true; runsess=$(clean_note "${1:-}") ;;
+        --session=*) runsess=$(clean_note "${1#*=}") ;;
+        -*) echo "unknown option for run: $1" >&2; exit 2 ;;
+        *)  [ -z "$runnote" ] && runnote=$(clean_note "$1") || { echo "unexpected argument: $1" >&2; exit 2; } ;;
+      esac
+      shift || true
+    done
+    [ "${1:-}" = "--" ] || { echo "usage: lock.sh run <name> \"note\" [--timeout S] [--session NAME] -- <command...>" >&2; exit 2; }
     shift
-    [ "$#" -gt 0 ] || { echo "usage: lock.sh run <name> \"note\" [--timeout S] -- <command...>" >&2; exit 2; }
+    [ "$#" -gt 0 ] || { echo "usage: lock.sh run <name> \"note\" [--timeout S] [--session NAME] -- <command...>" >&2; exit 2; }
     # Resolve first so the trap releases the same name acquire took.
     resolve "$name" || CANON=$name
     runcanon=$CANON
-    "$0" wait "$runcanon" "$runnote" "$runto" || { echo "run: never acquired $runcanon, command NOT started" >&2; exit 2; }
+    wait_cmd=("$0" wait "$runcanon" "$runnote" "$runto")
+    [ -n "$runsess" ] && wait_cmd+=("--session" "$runsess")
+    "${wait_cmd[@]}" || { echo "run: never acquired $runcanon, command NOT started" >&2; exit 2; }
     # From here the lock is ours and must come back on every path: normal exit, a failing
     # command, or a signal. Without the signal traps a Ctrl-C or a harness timeout leaks it,
     # which is the exact failure this subcommand exists to remove.

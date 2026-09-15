@@ -14,14 +14,14 @@ machine. Backed by `~/.claude/skills/lock/lock.sh` (atomic `mkdir` under
 
 ```bash
 L=~/.claude/skills/lock/lock.sh
-"$L" acquire <name> ["note"]   # take the lock; note = what you're doing
+"$L" acquire <name> ["note"] [--session S]  # take the lock; note = what you're doing
 "$L" wait <name> ["note"] [timeout_s]  # blocking acquire, retries every 2s (default timeout 3600)
 "$L" release <name> [--force]  # give it back; --force breaks another session's lock
 "$L" status  <name>            # FREE or HELD (+ holder info)
 "$L" list                      # all locks, [held] / [stale] / [FLAGGED]
 "$L" top [filter] [-i S]       # live responsive monitor (compact cards <80 cols, table >=80 cols; -1 for once)
 "$L" note   <name> "text"      # correct the note on a lock you hold
-"$L" run    <name> "note" [--timeout S] -- <cmd...>   # acquire, run, ALWAYS release
+"$L" run    <name> ["note"] [--session S] [--timeout S] -- <cmd...>   # acquire, run, ALWAYS release
 "$L" park   <name> "reason"    # done with it but can't release: others may take it
 "$L" unpark <name>             # cancel that; it is a normal held lock again
 "$L" flag   <name> "reason"    # raise a warning that OUTLIVES the lock

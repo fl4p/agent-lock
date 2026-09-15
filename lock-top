@@ -89,6 +89,31 @@ def shorten_path(path: str, max_w: int = 40) -> str:
     return "..." + path[-(max_w - 3):]
 
 
+def limit_24(text: str) -> str:
+    """Limit text to the first 24 characters, adding ellipsis if truncated."""
+    if not text:
+        return ""
+    clean = text.replace("\n", " ").strip()
+    return clean[:24] + "..." if len(clean) > 24 else clean
+
+
+def get_holder_string(user: str, pid: str, agent: str, session: str) -> str:
+    """Format holder as: '<agentName> <sessionName>' per specification."""
+    agent_clean = agent.strip() if agent else ""
+    sess_clean = session.strip() if session else ""
+    if agent_clean and sess_clean:
+        return f"{agent_clean} {sess_clean}"
+    if agent_clean and pid:
+        return f"{agent_clean} ({pid})"
+    if agent_clean:
+        return agent_clean
+    if user and sess_clean:
+        return f"{user} {sess_clean}"
+    if user and pid:
+        return f"{user} ({pid})"
+    return user or "unknown"
+
+
 def make_labeled_line(name: str, text: str, width: int, text_style: str = ""):
     """Format an indented labeled line with consistent 10-char column alignment."""
     if not text:
@@ -214,7 +239,6 @@ def match_usb_device(canon: str, aliases: list, usb_devs: list):
             n_clean = re.sub(r"[^a-zA-Z0-9]", "", n).lower()
             if not n_clean:
                 continue
-            # Full match or MAC 4-character hex suffix match (e.g. esp32s3-ad38 -> AD:38)
             if sn_clean == n_clean:
                 return d
             if len(sn_clean) >= 4 and n_clean.endswith(sn_clean[-4:]):
@@ -296,16 +320,14 @@ def verify_ps_works() -> bool:
 
 def get_process_details(pid_str):
     """
-    Retrieve process liveness, args, cwd, and short agent label.
+    Retrieve process liveness, args, cwd, and agent label.
     Follows lock.sh's rule: only declare DEAD if ps is provably functional and returns empty.
-    If ps cannot answer, fails, or times out, fail-closed (assume ALIVE / UNVERIFIED).
     """
     try:
         pid = int(pid_str)
     except (ValueError, TypeError):
         return True, {"pid": pid_str, "status": "UNKNOWN (invalid pid)"}
 
-    # Control test: if ps doesn't work for self, don't condemn the holder
     if not verify_ps_works():
         return True, {"pid": pid, "status": "ALIVE (ps unverified)"}
 
@@ -316,15 +338,12 @@ def get_process_details(pid_str):
             text=True,
             timeout=1,
         )
-        # ps succeeded and output is empty: provably dead
         if res.returncode == 0 and not res.stdout.strip():
             return False, {"pid": pid, "status": "DEAD"}
 
-        # ps returned non-zero with empty stdout: ps says pid not found -> dead
         if res.returncode != 0 and not res.stdout.strip() and not res.stderr.strip():
             return False, {"pid": pid, "status": "DEAD"}
 
-        # ps threw error (e.g. permission denied) -> fail closed (assume alive)
         if res.returncode != 0:
             return True, {"pid": pid, "status": "ALIVE (unverified)"}
 
@@ -337,13 +356,27 @@ def get_process_details(pid_str):
         exe = os.path.basename(cmd_tokens[0]) if cmd_tokens else ""
 
         agent_label = exe
+        if "claude" in exe or "claude" in args:
+            agent_label = "claude"
+        elif "codex" in exe or "codex" in args:
+            agent_label = "codex"
+        elif "pi" in exe or "pi" in args:
+            agent_label = "pi"
+        elif "opencode" in exe or "opencode" in args:
+            agent_label = "opencode"
+
+        session_id = None
         m_resume = re.search(r"--resume[= ]([a-f0-9-]+)", args)
         if m_resume:
-            agent_label += f" [{m_resume.group(1)[:8]}]"
-        elif "claude" in exe or "claude" in args:
+            session_id = m_resume.group(1)[:8]
+        elif "--session-id" in args:
+            m_sid = re.search(r"--session-id[= ]([a-f0-9-]+)", args)
+            if m_sid:
+                session_id = m_sid.group(1)[:8]
+        elif "callerAgentId=" in args:
             m_caller = re.search(r"callerAgentId=([a-f0-9-]+)", args)
             if m_caller:
-                agent_label += f" [{m_caller.group(1)[:8]}]"
+                session_id = m_caller.group(1)[:8]
 
         cwd = None
         try:
@@ -399,11 +432,11 @@ def get_process_details(pid_str):
             "exe": exe,
             "args": args,
             "label": agent_label,
+            "session_id": session_id,
             "cwd": cwd,
             "child": child_summary,
         }
     except Exception as e:
-        # On any exception, fail closed: assume alive
         return True, {"pid": pid, "status": "ALIVE (unverified)", "error": str(e), "label": f"PID {pid}"}
 
 
@@ -492,7 +525,6 @@ def collect_data(lock_dir: str, aliases_path: str, show_all: bool = False, query
         usb_match = match_usb_device(canon, alist, usb_devs)
         hint = project_hints.get(canon, {})
 
-        # Find ALL active locks that exist for this canonical resource and its aliases
         matching_lock_keys = []
         for candidate in [canon] + alist:
             if candidate in lock_map:
@@ -528,11 +560,9 @@ def collect_data(lock_dir: str, aliases_path: str, show_all: bool = False, query
         hw_serial = usb_match.get("serial", "") if usb_match else hint.get("mac", "")
         label = hint.get("label", canon)
 
-        # Handle split lock conflict (both canonical and alias held simultaneously!)
         is_split_collision = len(matching_lock_keys) > 1
 
         if matching_lock_keys:
-            # If split collision, render all holders
             for active_lock_key in matching_lock_keys:
                 lock_entry = lock_map[active_lock_key]
                 info = lock_entry["info"]
@@ -559,6 +589,14 @@ def collect_data(lock_dir: str, aliases_path: str, show_all: bool = False, query
 
                 is_alive, proc_info = get_process_details(pid_str)
 
+                # Resolve agent and session name
+                agent = info.get("agent", "")
+                session = info.get("session", "")
+                if not agent and proc_info:
+                    agent = proc_info.get("label", "")
+                if not session and proc_info:
+                    session = proc_info.get("session_id", "")
+
                 if not is_alive and pid_str != "unknown":
                     status = "STALE"
                 elif parked:
@@ -583,6 +621,8 @@ def collect_data(lock_dir: str, aliases_path: str, show_all: bool = False, query
                     "serial": hw_serial,
                     "port_open": port_open,
                     "user": user,
+                    "agent": agent,
+                    "session": session,
                     "pid": pid_str,
                     "proc": proc_info,
                     "since": since_str,
@@ -614,6 +654,8 @@ def collect_data(lock_dir: str, aliases_path: str, show_all: bool = False, query
                 "serial": hw_serial,
                 "port_open": port_open,
                 "user": user,
+                "agent": "",
+                "session": "",
                 "pid": "",
                 "proc": None,
                 "since": "",
@@ -652,6 +694,13 @@ def collect_data(lock_dir: str, aliases_path: str, show_all: bool = False, query
                 duration_s = now - mtime if mtime else 0.0
 
         is_alive, proc_info = get_process_details(pid_str)
+        agent = info.get("agent", "")
+        session = info.get("session", "")
+        if not agent and proc_info:
+            agent = proc_info.get("label", "")
+        if not session and proc_info:
+            session = proc_info.get("session_id", "")
+
         if not is_alive and pid_str != "unknown":
             status = "STALE"
         elif parked:
@@ -671,6 +720,8 @@ def collect_data(lock_dir: str, aliases_path: str, show_all: bool = False, query
             "serial": "",
             "port_open": [],
             "user": user,
+            "agent": agent,
+            "session": session,
             "pid": pid_str,
             "proc": proc_info,
             "since": since_str,
@@ -701,6 +752,8 @@ def collect_data(lock_dir: str, aliases_path: str, show_all: bool = False, query
             "serial": "",
             "port_open": [],
             "user": flag_data.get("by", ""),
+            "agent": "",
+            "session": "",
             "pid": "",
             "proc": None,
             "since": flag_data.get("flagged", ""),
@@ -787,15 +840,13 @@ def render_compact(items, unregistered, lock_dir: str, interval: int, count: int
         elif b.get("is_alias"):
             lines.append(f"  {YELLOW}▲ Legacy lock name: {b['lock_key']}{RESET}")
 
-        if b["pid"]:
-            lines.append(f"  {DIM}{'Holder:':<7}{RESET} {b['user']} {DIM}(PID {b['pid']}){RESET}")
-        elif b["user"] and "FREE" not in st:
-            lines.append(f"  {DIM}{'Holder:':<7}{RESET} {b['user']}")
+        # Holder: <agentName> <sessionName> - and NO separate Agent row!
+        if "FREE" not in st and (b.get("user") or b.get("agent")):
+            holder_display = get_holder_string(b.get("user", ""), b.get("pid", ""), b.get("agent", ""), b.get("session", ""))
+            lines.append(f"  {DIM}{'Holder:':<7}{RESET} {holder_display}")
 
         proc = b.get("proc")
-        if proc and isinstance(proc, dict) and proc.get("args"):
-            agent_str = proc.get("label", proc.get("exe", ""))
-            lines.append(f"  {DIM}{'Agent:':<7}{RESET} {BOLD}{agent_str}{RESET}")
+        if proc and isinstance(proc, dict):
             if proc.get("cwd"):
                 c_path = shorten_path(proc["cwd"], max(15, width - 12))
                 lines.append(f"  {DIM}{'Path:':<7}{RESET} {c_path}")
@@ -810,18 +861,17 @@ def render_compact(items, unregistered, lock_dir: str, interval: int, count: int
                 else:
                     lines.extend(make_labeled_line("Serial:", f"open by PID {p_pid} ({p_cmd}, {p_usr}) CONFLICT!", width, text_style=BOLD + RED))
 
+        # Only display the first 24 chars for Why / Flag, and avoid duplicating if purely flagged
         if b.get("note") and b["note"].strip() and "FLAGGED" not in st:
-            lines.extend(make_labeled_line("Why:", b["note"].strip(), width, text_style=ITALIC))
+            lines.extend(make_labeled_line("Why:", limit_24(b["note"]), width, text_style=ITALIC))
 
         if b.get("parked"):
             p_reason = b["parked"]["reason"].strip()
-            lines.extend(make_labeled_line("Parked:", p_reason, width, text_style=YELLOW))
+            lines.extend(make_labeled_line("Parked:", limit_24(p_reason), width, text_style=YELLOW))
 
         if b.get("flag"):
             f_reason = b["flag"].get("reason", "").strip()
-            if len(f_reason) > 130 and "FLAGGED" in st:
-                f_reason = f_reason[:127].rsplit(" ", 1)[0] + "..."
-            lines.extend(make_labeled_line("Flag:", f_reason, width, text_style=MAGENTA))
+            lines.extend(make_labeled_line("Flag:", limit_24(f_reason), width, text_style=MAGENTA))
 
         lines.append("")
 
@@ -846,15 +896,15 @@ def render_compact(items, unregistered, lock_dir: str, interval: int, count: int
             name_part = f"{sym} {WHITE}{ol['resource']}{RESET}"
             spaces = max(1, width - visible_len(name_part) - visible_len(badge))
             lines.append(f"{name_part}{' ' * spaces}{badge}")
-            if ol["user"]:
-                lines.append(f"  {DIM}{'By:':<7}{RESET} {ol['user']}")
+            holder_disp = get_holder_string(ol.get("user", ""), ol.get("pid", ""), ol.get("agent", ""), ol.get("session", ""))
+            if holder_disp and holder_disp != "unknown":
+                lines.append(f"  {DIM}{'Holder:':<7}{RESET} {holder_disp}")
             if ol["duration_s"] > 0:
                 lines.append(f"  {DIM}{'For:':<7}{RESET} {format_duration(ol['duration_s'])}")
-            if ol["note"]:
-                note_raw = ol["note"].strip()
-                if len(note_raw) > 130:
-                    note_raw = note_raw[:127].rsplit(" ", 1)[0] + "..."
-                lines.extend(make_labeled_line("Why:", note_raw, width, text_style=DIM))
+            if ol.get("flag"):
+                lines.extend(make_labeled_line("Flag:", limit_24(ol["flag"].get("reason", "")), width, text_style=MAGENTA))
+            elif ol.get("note"):
+                lines.extend(make_labeled_line("Why:", limit_24(ol["note"]), width, text_style=DIM))
             lines.append("")
 
     lines.append("─" * width)
@@ -880,7 +930,6 @@ def render_wide(items, unregistered, lock_dir: str, interval: int, count: int, w
     num_held = sum(1 for b in all_items if any(s in b["status"] for s in ("HELD", "PARKED", "STALE", "CONFLICT")))
     num_free = sum(1 for b in all_items if "FREE" in b["status"])
 
-    # Format subtitle cleanly fitting within width
     sub_full = f"{DIM}Store: {lock_dir}  │  Locks: {BOLD}{GREEN}{num_free} FREE{RESET}{DIM}, {BOLD}{RED if num_held else GREEN}{num_held} HELD{RESET}{DIM}  │  every {interval}s (cycle #{count}){RESET}"
     if visible_len(sub_full) > width:
         sub_full = f"{BOLD}{GREEN}{num_free} FREE{RESET}{DIM} · {BOLD}{RED if num_held else GREEN}{num_held} HELD{RESET}{DIM} · every {interval}s (cycle #{count}){RESET}"
@@ -889,10 +938,8 @@ def render_wide(items, unregistered, lock_dir: str, interval: int, count: int, w
     lines.append(sub_full)
     lines.append("─" * width)
 
-    # Strictly bounded column allocation guaranteeing sum(cols) + separators <= width
     c_status = 9
     c_dur = 11
-    # 5 separators of 1 space = 5
     avail = max(30, width - (c_status + c_dur + 5))
     c_name = max(10, min(16, int(avail * 0.22)))
     c_port = max(12, min(18, int(avail * 0.25)))
@@ -904,7 +951,7 @@ def render_wide(items, unregistered, lock_dir: str, interval: int, count: int, w
         f"{'PORT / DEVICE':<{c_port}} {'HOLDER':<{c_holder}} "
         f"{'DURATION':<{c_dur}} {'WHY / NOTE':<{c_why}}{RESET}"
     )
-    lines.append(hdr[:width + 100])  # ensure header line length is safe
+    lines.append(hdr[:width + 100])
     lines.append("─" * width)
 
     if not all_items:
@@ -941,10 +988,9 @@ def render_wide(items, unregistered, lock_dir: str, interval: int, count: int, w
         pad_port = max(0, c_port - visible_len(port_str))
         port_col = f"{port_str[:c_port]}{' ' * pad_port}"
 
-        if b["pid"]:
-            holder_text = f"{b['user']} ({b['pid']})"
-        elif b["user"] and "FREE" not in status:
-            holder_text = b["user"]
+        # Holder: <agentName> <sessionName>
+        if "FREE" not in status:
+            holder_text = get_holder_string(b.get("user", ""), b.get("pid", ""), b.get("agent", ""), b.get("session", ""))
         else:
             holder_text = f"{DIM}—{RESET}"
         pad_holder = max(0, c_holder - visible_len(holder_text))
@@ -959,11 +1005,12 @@ def render_wide(items, unregistered, lock_dir: str, interval: int, count: int, w
         pad_dur = max(0, c_dur - visible_len(dur_str))
         dur_col = f"{dur_str[:c_dur]}{' ' * pad_dur}"
 
-        note_str = b.get("note", "").replace("\n", " ").strip()
-        is_note_truncated = len(note_str) > c_why
-        first_note = note_str[:c_why - 3] + "..." if is_note_truncated else note_str
-        if not first_note:
-            first_note = f"{DIM}—{RESET}"
+        # First 24 chars for Why / Flag
+        if b.get("flag") and "FLAGGED" in status:
+            raw_text = b["flag"].get("reason", "")
+        else:
+            raw_text = b.get("note", "")
+        first_note = limit_24(raw_text) if raw_text else f"{DIM}—{RESET}"
         pad_why = max(0, c_why - visible_len(first_note))
         why_col = f"{first_note[:c_why]}{' ' * pad_why}"
 
@@ -975,19 +1022,15 @@ def render_wide(items, unregistered, lock_dir: str, interval: int, count: int, w
         elif b.get("is_alias"):
             lines.append(f"   {YELLOW}▲ Held under legacy alias '{b['lock_key']}' instead of canonical '{b['resource']}'!{RESET}")
 
-        if is_note_truncated and note_str and "FLAGGED" not in status:
-            lines.extend(make_labeled_line("Why:", note_str, width - 2, text_style=ITALIC))
-
         proc = b.get("proc")
-        if proc and isinstance(proc, dict) and proc.get("args"):
-            proc_label = proc.get("label", proc.get("exe", ""))
-            agent_details = []
+        if proc and isinstance(proc, dict):
+            details = []
             if proc.get("cwd"):
-                agent_details.append(f"in {shorten_path(proc.get('cwd', ''), 25)}")
+                details.append(f"in {shorten_path(proc['cwd'], 25)}")
             if proc.get("child"):
-                agent_details.append(f"active: {proc.get('child')}")
-            agent_str = f"{proc_label} ({', '.join(agent_details)})" if agent_details else proc_label
-            lines.extend(make_labeled_line("Agent:", agent_str, width - 2, text_style=BOLD))
+                details.append(f"active: {proc['child']}")
+            if details:
+                lines.extend(make_labeled_line("Path:", ", ".join(details), width - 2))
 
         if b.get("port_open"):
             for p_pid, p_usr, p_cmd in b["port_open"]:
@@ -996,12 +1039,6 @@ def render_wide(items, unregistered, lock_dir: str, interval: int, count: int, w
                     lines.extend(make_labeled_line("Serial:", f"open by PID {p_pid} ({p_cmd}) [holder task]", width - 2, text_style=GREEN))
                 else:
                     lines.extend(make_labeled_line("Serial:", f"open by PID {p_pid} ({p_cmd}, {p_usr}) CONFLICT!", width - 2, text_style=BOLD + RED))
-
-        if b.get("parked"):
-            lines.extend(make_labeled_line("Parked:", b["parked"]["reason"].strip(), width - 2, text_style=YELLOW))
-
-        if b.get("flag"):
-            lines.extend(make_labeled_line("Flag:", b["flag"].get("reason", "").strip(), width - 2, text_style=MAGENTA))
 
     if unregistered:
         lines.append("")
@@ -1022,16 +1059,14 @@ def render_wide(items, unregistered, lock_dir: str, interval: int, count: int, w
                 st_col = f"{st:<9}"
 
             r_name = f"{WHITE}{ol['resource']:<18}{RESET}"
-            h_str = f"{ol['user']} (pid {ol['pid']})" if ol["pid"] else (ol["user"] or f"{DIM}—{RESET}")
+            h_str = get_holder_string(ol.get("user", ""), ol.get("pid", ""), ol.get("agent", ""), ol.get("session", ""))
             pad_h = max(0, 18 - visible_len(h_str))
             h_col = f"{h_str}{' ' * pad_h}"
             d_str = format_duration(ol["duration_s"]) if ol["duration_s"] > 0 else f"{DIM}—{RESET}"
             pad_d = max(0, 11 - visible_len(d_str))
             d_col = f"{d_str}{' ' * pad_d}"
-            note_w = max(15, width - 60)
-            first_note = ol["note"].replace("\n", " ").strip()
-            if len(first_note) > note_w:
-                first_note = first_note[:note_w - 3] + "..."
+            note_raw = ol.get("flag", {}).get("reason", "") if ol.get("flag") else ol.get("note", "")
+            first_note = limit_24(note_raw)
             lines.append(f"{r_name} {st_col} {h_col} {d_col} {first_note}")
 
     lines.append("─" * width)
