@@ -155,7 +155,8 @@ def parse_registry(aliases_path: str):
                 if canon.startswith("!"):
                     banned[canon[1:]] = rest.strip()
                     continue
-                aliases = [a.strip() for a in rest.split() if a.strip()]
+                # `!word` tokens are per-resource options (e.g. !session), not aliases.
+                aliases = [a.strip() for a in rest.split() if a.strip() and not a.startswith("!")]
                 registry[canon] = aliases
     except Exception:
         pass
