@@ -266,6 +266,14 @@ canon_or_literal() { # inspect/repair path: sets CANON. A lock that exists on di
 }
 
 # --- ownership ---------------------------------------------------------------------
+claude_versioned() { # $1 pid, $2 comm: Claude Code's .../claude/versions/<ver> binary
+  case "$2" in */claude/versions/*) return 0 ;; esac
+  case "${2##*/}" in [0-9]*.[0-9]*) ;; *) return 1 ;; esac
+  local a; a=$(ps -o args= -p "$1" 2>/dev/null)
+  case "${a%% *}" in */claude/versions/*) return 0 ;; esac   # Linux: comm is the bare name
+  return 1
+}
+
 owner_pid() { # walk ancestry to the long-lived agent process; "unknown" if none
   # A DETACHED daemon has no agent ancestor -- nohup reparents it to launchd/init -- so the
   # walk below returns "unknown" and every ownership test fails closed. That is right for a
@@ -284,8 +292,10 @@ owner_pid() { # walk ancestry to the long-lived agent process; "unknown" if none
   while :; do
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
     [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] || break
-    comm=$(basename "$(ps -o comm= -p "$pid" 2>/dev/null)")
-    case "$comm" in claude|node|bun|codex|opencode|pi) echo "$pid"; return;; esac
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null)
+    # Claude Code runs as .../claude/versions/<version>: the basename is a version number.
+    claude_versioned "$pid" "$comm" && { echo "$pid"; return; }
+    case "$(basename "$comm")" in claude|node|bun|codex|opencode|pi) echo "$pid"; return;; esac
   done
   echo unknown  # fail closed: never auto-stolen, --force only
 }
@@ -294,7 +304,8 @@ owner_agent() { # identify agent binary/name from owner pid
   local pid=${1:-unknown}
   [ "$pid" = unknown ] || [ -z "$pid" ] && { echo "${AI_AGENT:-unknown}"; return; }
   local comm
-  comm=$(basename "$(ps -o comm= -p "$pid" 2>/dev/null)")
+  comm=$(ps -o comm= -p "$pid" 2>/dev/null)
+  if claude_versioned "$pid" "$comm"; then comm=claude; else comm=$(basename "$comm"); fi
   case "$comm" in
     claude) echo "claude" ;;
     codex|codex-*) echo "codex" ;;
@@ -320,6 +331,12 @@ owner_session() { # $1 = explicit session, $2 = owner pid
   if [ -n "${SESSION_NAME:-}" ]; then echo "$SESSION_NAME"; return; fi
   if [ -n "${PI_SESSION_ID:-}" ]; then echo "${PI_SESSION_ID:0:8}"; return; fi
   if [ -n "${CODEX_SESSION_ID:-}" ]; then echo "${CODEX_SESSION_ID:0:8}"; return; fi
+  # Claude Code: "<name> (<sid8>)", the name ListAgents/SendMessage address (Paseo ids are not).
+  if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+    local finder=${AGENT_LOCK_SESSION_FIND:-$HOME/dev/bin/session-find} name=""
+    [ -x "$finder" ] && name=$("$finder" "$CLAUDE_CODE_SESSION_ID" 2>/dev/null | awk -v id="$CLAUDE_CODE_SESSION_ID" '$NF==id && $1!="?"{print $1; exit}')
+    echo "${name:+$name }(${CLAUDE_CODE_SESSION_ID:0:8})"; return
+  fi
   if [ -n "${PASEO_AGENT_ID:-}" ]; then echo "${PASEO_AGENT_ID:0:8}"; return; fi
   local pid=${2:-unknown}
   if [ "$pid" != unknown ] && [ -n "$pid" ]; then

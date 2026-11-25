@@ -108,7 +108,8 @@ The rules the script enforces:
   `status` marks it `(YOURS)`.
 - **No session on either side** = exactly the old behaviour (pid alone) — except on resources
   marked `!session` (below). The lock's `session=` label then ends in `(pid-only)`, because the
-  derived label (e.g. `PASEO_AGENT_ID`) is shared by every sibling and is not an identity.
+  derived label is shared by every sibling and is not an identity. In Claude Code the label is
+  `<session name> (<sid8>)` (via `~/dev/bin/session-find`), the name `ListAgents`/SendMessage use.
 - An **empty**, malformed, or conflicting (`--session a --session b`) session is exit 2, not "no
   session": `--session "$S"` with `S` unset would otherwise drop you back to sharing your
   siblings' locks. So is a misspelt option.
@@ -227,7 +228,9 @@ A `wait` whose caller has gone (its parent pid changed or was already launchd) o
 agent process has died gives up with exit 2 instead of acquiring later as `pid=unknown` — such
 a lock is never stale, so only `--force` would ever clear it. For the same reason `acquire`
 refuses to *create* a lock when no owning agent process can be found; a long-lived holder
-outside an agent session names itself with `export AGENT_LOCK_OWNER_PID=$$`. A `wait` killed by
+outside an agent session names itself with `export AGENT_LOCK_OWNER_PID=$$`. The owning agent
+is the nearest ancestor named `claude`, `node`, `bun`, `codex`, `opencode` or `pi`, or running
+from a `*/claude/versions/*` path (Claude Code's versioned binary). A `wait` killed by
 TERM/INT/HUP finishes its in-flight attempt and gives back anything that attempt just took.
 
 **Finishing.** Release before you return your result. If you must hand over hardware without

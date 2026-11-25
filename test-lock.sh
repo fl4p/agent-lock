@@ -14,7 +14,7 @@ trap 'rm -rf "$TMP"' EXIT
 export AGENT_LOCK_DIR="$TMP/locks"
 export AGENT_LOCK_ALIASES="$TMP/aliases.conf"
 # A session inherited from the caller's environment would silently change every case below.
-unset AGENT_LOCK_SESSION AGENT_LOCK_OWNER_PID
+unset AGENT_LOCK_SESSION AGENT_LOCK_OWNER_PID CLAUDE_CODE_SESSION_ID PI_SESSION_ID CODEX_SESSION_ID PASEO_AGENT_ID
 
 pass=0; fail=0
 ok()   { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
@@ -1781,6 +1781,35 @@ S acquire fab-chrome "no cap" --session nc-1 >/dev/null 2>&1
 hasnt "without !maxhold no hold_until is recorded" "hold_until=" "$(info fab-chrome)"
 S release fab-chrome --session nc-1 >/dev/null 2>&1
 unset AGENT_LOCK_MIN_LEASE
+
+echo "== 79. Claude Code lock label is the ListAgents name + sid, not a Paseo id (2026-11-25) =="
+# A Paseo agent id won the label, so the bench-139c holder could not be found by session name.
+fresh
+printf '#!/bin/sh\necho "other-1  uds:/y pid 2 busy title mentions $1 x"\necho "fugu-test-9f  uds:/x pid 1 busy $1"\n' > "$TMP/sfind"; chmod +x "$TMP/sfind"
+CLAUDE_CODE_SESSION_ID=73170243-aaaa PASEO_AGENT_ID=8fd849ce-bbbb AGENT_LOCK_SESSION_FIND="$TMP/sfind" \
+  S acquire fugu-rig "label test" >/dev/null 2>&1
+info=$(cat "$AGENT_LOCK_DIR/fugu-rig.lock/info" 2>/dev/null)
+has   "79a label carries the session name" "session=fugu-test-9f (73170243) (pid-only)" "$info"
+hasnt "79b Paseo id is not the label" "8fd849ce" "$info"
+S release fugu-rig >/dev/null 2>&1
+CLAUDE_CODE_SESSION_ID=73170243-aaaa AGENT_LOCK_SESSION_FIND=/nonexistent S acquire fugu-rig "label test" >/dev/null 2>&1
+has   "79c no session-find: sid prefix only" "session=(73170243) (pid-only)" "$(cat "$AGENT_LOCK_DIR/fugu-rig.lock/info" 2>/dev/null)"
+S release fugu-rig >/dev/null 2>&1
+
+echo "== 80. ancestry walk finds Claude Code installed as .../claude/versions/<ver> (2026-11-25) =="
+# Its process name is the version ("2.1.329"), so plain acquire from Claude Code got pid=unknown.
+fresh
+# A symlink keeps the path as the process name (a copied /bin/bash is killed by code signing);
+# the second command stops bash from exec'ing lock.sh in its place.
+mkdir -p "$TMP/claude/versions"; ln -sf /bin/bash "$TMP/claude/versions/9.9.9"
+# Run from Claude Code, a missed match would climb on to the real claude process: assert the pid.
+out=$(env -u AGENT_LOCK_OWNER_PID "$TMP/claude/versions/9.9.9" -c 'echo "inner=$$"; "$0" acquire fugu-rig "walk test"; r=$?; exit $r' "$L" 2>&1); rc=$?
+check "80a acquire under a versioned claude binary succeeds" 0 "$rc" "$out"
+inner=$(printf '%s\n' "$out" | sed -n 's/^inner=//p')
+info=$(cat "$AGENT_LOCK_DIR/fugu-rig.lock/info" 2>/dev/null)
+has   "80b owner is that very process" "pid=$inner"$'\n' "$info"
+has   "80c agent is claude" "agent=claude" "$info"
+rm -rf "$AGENT_LOCK_DIR/fugu-rig.lock"
 
 echo "passed $pass, failed $fail"
 [ "$fail" = 0 ] || exit 1
